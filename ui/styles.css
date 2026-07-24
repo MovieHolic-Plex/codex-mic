@@ -1,0 +1,47 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+body {
+  display: flex; align-items: center; justify-content: center;
+  font: 13px/1 "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.pill {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; height: 100%;
+  padding: 0 16px;
+  border-radius: 28px;
+  background: rgba(18, 22, 28, 0.92);
+  border: 1px solid rgba(126, 240, 192, 0.25);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+  color: #e6e9ee;
+  user-select: none;
+}
+
+.pill[data-state="on"] {
+  border-color: rgba(126, 240, 192, 0.7);
+  box-shadow: 0 0 0 1px rgba(126, 240, 192, 0.3), 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+.pill[data-state="error"] { border-color: rgba(255, 107, 107, 0.7); }
+
+.mic {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #5a6370; flex: 0 0 auto;
+  transition: background .12s, box-shadow .12s;
+}
+.pill[data-state="on"] .mic {
+  background: #ff5a5a;
+  box-shadow: 0 0 0 4px rgba(255, 90, 90, 0.18);
+  animation: pulse 1s ease-in-out infinite;
+}
+.pill[data-state="error"] .mic { background: #ff6b6b; }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(255, 90, 90, 0.18); }
+  50% { box-shadow: 0 0 0 7px rgba(255, 90, 90, 0.06); }
+}
+
+.label {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  letter-spacing: .2px;
+}

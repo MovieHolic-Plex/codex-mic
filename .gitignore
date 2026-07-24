@@ -1,0 +1,5 @@
+src-tauri/target/
+_protocol/
+.omo/ulw-research/
+.omo/ulw-loop/bootstrap-notepad.md
+*.exe

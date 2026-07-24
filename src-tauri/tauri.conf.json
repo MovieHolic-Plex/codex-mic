@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex Mic",
+  "version": "0.1.0",
+  "identifier": "com.codexmic.app",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Codex Mic",
+        "width": 420,
+        "height": 56,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "visible": false,
+        "center": true,
+        "y": 40
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "withGlobalTauri": true
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Codex voice dictation",
+    "longDescription": "Ctrl+E to dictate text into any window using Codex's realtime API."
+  }
+}

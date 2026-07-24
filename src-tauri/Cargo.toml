@@ -1,0 +1,33 @@
+[package]
+name = "codex-mic"
+version = "0.1.0"
+description = "Codex Mic — a Tauri app that exposes Codex's thread realtime (mic) API"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "codex_mic_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+enigo = "0.5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "test-util"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
