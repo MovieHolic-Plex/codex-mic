@@ -20,10 +20,7 @@ pub struct ConnectInfo {
 
 const DEFAULT_CODEX: &str = r"C:\Users\hyeon\.codex\packages\standalone\current\bin\codex.exe";
 
-fn resolve_codex_bin(explicit: Option<&str>) -> String {
-    if let Some(p) = explicit {
-        return p.to_string();
-    }
+fn resolve_codex_bin() -> String {
     if let Ok(p) = std::env::var("CODEX_BIN") {
         return p;
     }
@@ -46,13 +43,8 @@ impl CodexSession {
         &self.thread_id
     }
 
-    #[allow(dead_code)]
-    pub fn client(&self) -> &Arc<Client> {
-        &self.client
-    }
-
     pub async fn connect(emitter: Emitter) -> Result<(Self, ConnectInfo), RpcError> {
-        let program = resolve_codex_bin(None);
+        let program = resolve_codex_bin();
         let mut cmd = Command::new(&program);
         cmd.args([
             "app-server",
@@ -126,14 +118,23 @@ impl CodexSession {
         Ok((Self { client, thread_id, _reader: reader, _forwarder: forwarder }, info))
     }
 
-    pub async fn realtime_start(&self, sdp_offer: String) -> Result<(), RpcError> {
+    pub async fn realtime_start(&self) -> Result<(), RpcError> {
         let params = json!({
             "threadId": self.thread_id,
             "outputModality": "text",
-            "transport": { "type": "webrtc", "sdp": sdp_offer },
             "clientManagedHandoffs": true,
         });
         let _ = self.client.request("thread/realtime/start", params).await?;
+        Ok(())
+    }
+
+    pub async fn append_audio(&self, base64_pcm: String) -> Result<(), RpcError> {
+        self.client
+            .request(
+                "thread/realtime/appendAudio",
+                json!({ "threadId": self.thread_id, "audio": { "data": base64_pcm, "sampleRate": 24000, "numChannels": 1 } }),
+            )
+            .await?;
         Ok(())
     }
 
@@ -156,15 +157,11 @@ impl CodexSession {
     }
 }
 
-
 fn map_event(method: &str) -> Option<&'static str> {
     match method {
         "thread/realtime/started" => Some("realtime://started"),
-        "thread/realtime/sdp" => Some("realtime://sdp"),
         "thread/realtime/transcript/delta" => Some("realtime://transcript-delta"),
         "thread/realtime/transcript/done" => Some("realtime://transcript-done"),
-        "thread/realtime/outputAudio/delta" => Some("realtime://output-audio"),
-        "thread/realtime/itemAdded" => Some("realtime://item"),
         "thread/realtime/error" => Some("realtime://error"),
         "thread/realtime/closed" => Some("realtime://closed"),
         "warning" => Some("codex://warning"),

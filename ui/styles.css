@@ -11,30 +11,42 @@ body {
   padding: 0 16px;
   border-radius: 28px;
   background: rgba(18, 22, 28, 0.92);
-  border: 1px solid rgba(126, 240, 192, 0.25);
+  border: 1px solid rgba(255,255,255,0.1);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(10px);
   color: #e6e9ee;
   user-select: none;
+  transition: border-color .2s, box-shadow .2s;
 }
 
-.pill[data-state="on"] {
+.pill[data-state="hidden"] { opacity: 0.3; }
+.pill[data-state="recording"] {
+  border-color: rgba(255, 90, 90, 0.7);
+  box-shadow: 0 0 0 1px rgba(255,90,90,.3), 0 8px 28px rgba(0,0,0,.5);
+}
+.pill[data-state="processing"] {
+  border-color: rgba(255, 209, 102, 0.7);
+}
+.pill[data-state="success"] {
   border-color: rgba(126, 240, 192, 0.7);
-  box-shadow: 0 0 0 1px rgba(126, 240, 192, 0.3), 0 8px 28px rgba(0, 0, 0, 0.5);
 }
-.pill[data-state="error"] { border-color: rgba(255, 107, 107, 0.7); }
+.pill[data-state="error"] {
+  border-color: rgba(255, 107, 107, 0.7);
+}
 
-.mic {
+.dot {
   width: 10px; height: 10px; border-radius: 50%;
   background: #5a6370; flex: 0 0 auto;
-  transition: background .12s, box-shadow .12s;
+  transition: background .12s;
 }
-.pill[data-state="on"] .mic {
+.pill[data-state="recording"] .dot {
   background: #ff5a5a;
-  box-shadow: 0 0 0 4px rgba(255, 90, 90, 0.18);
   animation: pulse 1s ease-in-out infinite;
 }
-.pill[data-state="error"] .mic { background: #ff6b6b; }
+.pill[data-state="processing"] .dot { background: #ffd166; }
+.pill[data-state="success"] .dot { background: #7ef0c0; }
+.pill[data-state="error"] .dot { background: #ff6b6b; }
+
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 4px rgba(255, 90, 90, 0.18); }
   50% { box-shadow: 0 0 0 7px rgba(255, 90, 90, 0.06); }

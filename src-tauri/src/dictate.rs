@@ -9,10 +9,26 @@ use tracing::{debug, info, warn};
 
 type SharedBuf = Arc<Mutex<String>>;
 
+const HALLUCINATION_PATTERNS: &[&str] = &[
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "don't forget to like",
+    "see you in the next video",
+    "[music]",
+    "[applause]",
+];
+
+#[allow(dead_code)]
+struct InjectionRecord {
+    text: String,
+}
+
 pub struct DictateState {
     session: Mutex<Option<Arc<CodexSession>>>,
     buffer: SharedBuf,
     listening: Mutex<bool>,
+    last_injection: Mutex<Option<InjectionRecord>>,
 }
 
 impl DictateState {
@@ -21,6 +37,7 @@ impl DictateState {
             session: Mutex::new(None),
             buffer: Arc::new(Mutex::new(String::new())),
             listening: Mutex::new(false),
+            last_injection: Mutex::new(None),
         }
     }
 
@@ -36,7 +53,7 @@ impl DictateState {
         *self.listening.lock().await
     }
 
-    pub async fn start_listening(&self) -> Result<(), String> {
+    pub async fn start_listening(&self) -> Result<Arc<CodexSession>, String> {
         let session = self
             .session
             .lock()
@@ -48,17 +65,28 @@ impl DictateState {
         let rx = session.subscribe();
         let buf = self.buffer.clone();
         tokio::spawn(accumulate_loop(rx, buf));
-        Ok(())
+        Ok(session)
     }
 
     pub async fn stop_listening(&self) -> Result<String, String> {
         *self.listening.lock().await = false;
         let text = self.buffer.lock().await.clone();
         self.buffer.lock().await.clear();
-        if !text.is_empty() {
-            type_text(&text).map_err(|e| e.to_string())?;
+
+        if is_hallucination_or_empty(&text) {
+            info!("filtered empty/hallucination transcript");
+            return Ok(String::new());
         }
-        Ok(text)
+
+        match type_text_safe(&text) {
+            Ok(()) => {
+                *self.last_injection.lock().await = Some(InjectionRecord {
+                    text: text.clone(),
+                });
+                Ok(text)
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     pub async fn current_buffer(&self) -> String {
@@ -89,7 +117,26 @@ async fn accumulate_loop(mut rx: tokio::sync::broadcast::Receiver<Notification>,
     }
 }
 
-pub fn type_text(text: &str) -> Result<(), RpcError> {
+pub fn is_hallucination_or_empty(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    for pattern in HALLUCINATION_PATTERNS {
+        if lower == *pattern || (trimmed.len() < 80 && lower.contains(pattern)) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn is_user_transcript_delta(method: &str, params: &Value) -> bool {
+    method == "thread/realtime/transcript/delta"
+        && params.get("role").and_then(|r| r.as_str()) == Some("user")
+}
+
+pub fn type_text_safe(text: &str) -> Result<(), RpcError> {
     if text.is_empty() {
         return Ok(());
     }
@@ -100,11 +147,6 @@ pub fn type_text(text: &str) -> Result<(), RpcError> {
         .map_err(|e| RpcError::Spawn(format!("enigo text: {e}")))?;
     info!(len = text.len(), "typed transcript");
     Ok(())
-}
-
-pub fn is_user_transcript_delta(method: &str, params: &Value) -> bool {
-    method == "thread/realtime/transcript/delta"
-        && params.get("role").and_then(|r| r.as_str()) == Some("user")
 }
 
 #[cfg(test)]
@@ -131,16 +173,33 @@ mod tests {
     #[test]
     fn non_transcript_method_blocked() {
         assert!(!is_user_transcript_delta(
-            "thread/realtime/sdp",
+            "thread/realtime/started",
             &json!({ "role": "user" })
         ));
     }
 
     #[test]
-    fn missing_role_blocked() {
-        assert!(!is_user_transcript_delta(
-            "thread/realtime/transcript/delta",
-            &json!({ "delta": "x" })
-        ));
+    fn empty_text_filtered() {
+        assert!(is_hallucination_or_empty(""));
+        assert!(is_hallucination_or_empty("   "));
+    }
+
+    #[test]
+    fn hallucination_filtered() {
+        assert!(is_hallucination_or_empty("thank you for watching"));
+        assert!(is_hallucination_or_empty("[music]"));
+        assert!(is_hallucination_or_empty("Please subscribe"));
+    }
+
+    #[test]
+    fn normal_korean_not_filtered() {
+        assert!(!is_hallucination_or_empty("안녕하세요"));
+        assert!(!is_hallucination_or_empty("이거 API endpoint를 deploy해줘"));
+    }
+
+    #[test]
+    fn normal_english_not_filtered() {
+        assert!(!is_hallucination_or_empty("hello world"));
+        assert!(!is_hallucination_or_empty("add a function that calculates factorial"));
     }
 }

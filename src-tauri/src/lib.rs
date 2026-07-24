@@ -1,3 +1,4 @@
+mod audio;
 mod codex;
 mod commands;
 mod dictate;
@@ -13,10 +14,11 @@ const HOTKEY: &str = "Ctrl+E";
 
 fn show_indicator(window: &WebviewWindow) {
     let _ = window.show();
-    let _ = window.set_focus();
+    let _ = window.set_ignore_cursor_events(true);
 }
 
 fn hide_indicator(window: &WebviewWindow) {
+    let _ = window.set_ignore_cursor_events(false);
     let _ = window.hide();
 }
 
@@ -26,7 +28,7 @@ async fn ensure_connected(app: tauri::AppHandle) {
         return;
     }
     let app2 = app.clone();
-    match crate::codex::CodexSession::connect(commands_state_emitter(&app2)).await {
+    match crate::codex::CodexSession::connect(make_emitter(&app2)).await {
         Ok((session, info)) => {
             let session = std::sync::Arc::new(session);
             state.dictate.set_session(session.clone()).await;
@@ -38,7 +40,7 @@ async fn ensure_connected(app: tauri::AppHandle) {
     }
 }
 
-fn commands_state_emitter(app: &tauri::AppHandle) -> crate::codex::Emitter {
+fn make_emitter(app: &tauri::AppHandle) -> crate::codex::Emitter {
     let app = app.clone();
     std::sync::Arc::new(move |event: &str, payload: serde_json::Value| {
         let _ = app.emit(event, payload);
@@ -51,21 +53,60 @@ async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
         ensure_connected(app.clone()).await;
     }
     if state.dictate.is_listening().await {
+        let _ = app.emit("dictate://processing", serde_json::json!({}));
         match state.dictate.stop_listening().await {
-            Ok(typed) => {
-                info!(len = typed.len(), "dictation committed");
-                let _ = app.emit("dictate://stopped", serde_json::json!({ "text": typed }));
+            Ok(text) => {
+                info!(len = text.len(), "dictation committed");
+                let _ = app.emit("dictate://stopped", serde_json::json!({ "text": text }));
             }
-            Err(e) => warn!(error = %e, "stop failed"),
+            Err(e) => {
+                warn!(error = %e, "stop failed");
+                let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
+            }
+        }
+        if let Some(s) = state.session.lock().await.clone() {
+            let _ = s.realtime_stop().await;
         }
         hide_indicator(&window);
     } else {
-        match state.dictate.start_listening().await {
-            Ok(()) => {
+        let session = match state.dictate.start_listening().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "start failed");
+                let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
+                return;
+            }
+        };
+        if let Err(e) = session.realtime_start().await {
+            warn!(error = %e, "realtime_start failed");
+            let _ = app.emit("dictate://error", serde_json::json!({ "message": e.to_string() }));
+            return;
+        }
+        match crate::audio::AudioCapture::start() {
+            Ok(capture) => {
+                let session_clone = session.clone();
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_millis(100));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        for b64 in capture.read_all_pending() {
+                            if let Err(e) = session_clone.append_audio(b64).await {
+                                tracing::warn!(error = %e, "append_audio failed");
+                                return;
+                            }
+                        }
+                    }
+                });
                 let _ = app.emit("dictate://started", serde_json::json!({}));
                 show_indicator(&window);
             }
-            Err(e) => warn!(error = %e, "start failed"),
+            Err(e) => {
+                warn!(error = %e, "audio capture failed");
+                let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
+                let _ = session.realtime_stop().await;
+            }
         }
     }
 }
@@ -81,9 +122,7 @@ pub fn run() {
 
     let shortcut: Shortcut = HOTKEY.parse().expect("valid shortcut");
 
-    let mut builder = commands::builder();
-
-    builder = builder.plugin(
+    let builder = commands::builder().plugin(
         tauri_plugin_global_shortcut::Builder::new()
             .with_shortcut(shortcut)
             .expect("register shortcut")
@@ -103,7 +142,7 @@ pub fn run() {
             .build(),
     );
 
-    builder = builder.setup(|app| {
+    let builder = builder.setup(|app| {
         let app_handle = app.handle().clone();
         tauri::async_runtime::spawn(async move {
             ensure_connected(app_handle).await;
@@ -119,6 +158,7 @@ pub fn run() {
 #[cfg(test)]
 mod integration {
     use crate::codex::{CodexSession, Emitter};
+    use base64::Engine;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -128,7 +168,7 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn codex_realtime_lifecycle_against_real_binary() {
+    async fn codex_realtime_native_audio_pipeline() {
         if !enabled() {
             eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
             return;
@@ -141,33 +181,31 @@ mod integration {
 
         let (session, info) = CodexSession::connect(emitter)
             .await
-            .expect("connect to codex app-server");
-        assert!(!info.thread_id.is_empty(), "thread id should be set");
+            .expect("connect");
+        assert!(!info.thread_id.is_empty());
 
-        session
-            .realtime_start("v=0\r\n".into())
-            .await
-            .expect("realtime_start must be accepted by the server");
+        session.realtime_start().await.expect("realtime_start");
 
-        let deadline = Instant::now() + Duration::from_secs(12);
-        let mut saw_error = false;
+        let dummy_pcm =
+            base64::engine::general_purpose::STANDARD.encode([0u8; 4800]);
+        session.append_audio(dummy_pcm).await.expect("appendAudio");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_event = false;
         while Instant::now() < deadline {
             let hit = events
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(n, _)| n == "realtime://error");
+                .any(|(n, _)| n == "realtime://error" || n == "realtime://closed");
             if hit {
-                saw_error = true;
+                saw_event = true;
                 break;
             }
             drop(events.lock().unwrap());
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(
-            saw_error,
-            "expected a realtime://error notification to flow back through the client"
-        );
+        assert!(saw_event, "expected realtime event after appendAudio");
 
         let _ = session.realtime_stop().await;
         session.disconnect().await;

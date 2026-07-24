@@ -21,7 +21,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "pr
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-enigo = "0.5"
+enigo = "0.6"
+cpal = "0.15"
+base64 = "0.22"
+windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "test-util"] }
