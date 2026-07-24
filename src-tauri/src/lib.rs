@@ -13,13 +13,14 @@ use tracing::{info, warn};
 const HOTKEY: &str = "Ctrl+E";
 
 fn show_indicator(window: &WebviewWindow) {
-    let _ = window.show();
+    let _ = window.set_always_on_top(true);
     let _ = window.set_ignore_cursor_events(true);
+    info!("indicator shown");
 }
 
 fn hide_indicator(window: &WebviewWindow) {
-    let _ = window.set_ignore_cursor_events(false);
-    let _ = window.hide();
+    let _ = window.set_ignore_cursor_events(true);
+    info!("indicator hidden");
 }
 
 async fn ensure_connected(app: tauri::AppHandle) {
@@ -47,13 +48,34 @@ fn make_emitter(app: &tauri::AppHandle) -> crate::codex::Emitter {
     })
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+static TOGGLE_LOCK: AtomicBool = AtomicBool::new(false);
+static LAST_TOGGLE: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+
 async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
+    if TOGGLE_LOCK.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let guard = ToggleGuard;
+    let last = LAST_TOGGLE.get_or_init(|| std::sync::Mutex::new(Instant::now() - std::time::Duration::from_secs(10)));
+    {
+        let mut l = last.lock().unwrap();
+        if l.elapsed() < std::time::Duration::from_millis(800) {
+            return;
+        }
+        *l = Instant::now();
+    }
     let state = app.state::<AppState>();
     if !state.dictate.has_session().await {
         ensure_connected(app.clone()).await;
     }
     if state.dictate.is_listening().await {
         let _ = app.emit("dictate://processing", serde_json::json!({}));
+        if let Some(s) = state.session.lock().await.clone() {
+            let _ = s.realtime_stop().await;
+        }
         match state.dictate.stop_listening().await {
             Ok(text) => {
                 info!(len = text.len(), "dictation committed");
@@ -64,12 +86,9 @@ async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
                 let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
             }
         }
-        if let Some(s) = state.session.lock().await.clone() {
-            let _ = s.realtime_stop().await;
-        }
         hide_indicator(&window);
     } else {
-        let session = match state.dictate.start_listening().await {
+        let _session = match state.dictate.start_listening().await {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "start failed");
@@ -77,25 +96,17 @@ async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
                 return;
             }
         };
-        if let Err(e) = session.realtime_start().await {
-            warn!(error = %e, "realtime_start failed");
-            let _ = app.emit("dictate://error", serde_json::json!({ "message": e.to_string() }));
-            return;
-        }
         match crate::audio::AudioCapture::start() {
             Ok(capture) => {
-                let session_clone = session.clone();
+                let app_clone = app.clone();
                 tokio::spawn(async move {
                     let mut interval =
-                        tokio::time::interval(std::time::Duration::from_millis(100));
+                        tokio::time::interval(std::time::Duration::from_millis(50));
                     interval.tick().await;
                     loop {
                         interval.tick().await;
                         for b64 in capture.read_all_pending() {
-                            if let Err(e) = session_clone.append_audio(b64).await {
-                                tracing::warn!(error = %e, "append_audio failed");
-                                return;
-                            }
+                            let _ = app_clone.emit("audio://pcm", serde_json::json!({ "data": b64 }));
                         }
                     }
                 });
@@ -105,13 +116,18 @@ async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
             Err(e) => {
                 warn!(error = %e, "audio capture failed");
                 let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
-                let _ = session.realtime_stop().await;
             }
         }
     }
+    drop(guard);
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+struct ToggleGuard;
+impl Drop for ToggleGuard {
+    fn drop(&mut self) {
+        TOGGLE_LOCK.store(false, Ordering::SeqCst);
+    }
+}
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -130,11 +146,15 @@ pub fn run() {
                 if event.state != ShortcutState::Pressed {
                     return;
                 }
+                info!("Ctrl+E pressed");
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let window = match app.get_webview_window("main") {
                         Some(w) => w,
-                        None => return,
+                        None => {
+                            warn!("main window not found");
+                            return;
+                        }
                     };
                     toggle(app, window).await;
                 });
@@ -158,7 +178,6 @@ pub fn run() {
 #[cfg(test)]
 mod integration {
     use crate::codex::{CodexSession, Emitter};
-    use base64::Engine;
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -184,11 +203,7 @@ mod integration {
             .expect("connect");
         assert!(!info.thread_id.is_empty());
 
-        session.realtime_start().await.expect("realtime_start");
-
-        let dummy_pcm =
-            base64::engine::general_purpose::STANDARD.encode([0u8; 4800]);
-        session.append_audio(dummy_pcm).await.expect("appendAudio");
+        session.realtime_start("v=0\r\n".into()).await.expect("realtime_start");
 
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut saw_event = false;

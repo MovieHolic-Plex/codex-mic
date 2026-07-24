@@ -1,58 +1,136 @@
-# Codex Mic
+# Codex Mic / 코덱스 마이크
 
-**Ctrl+E를 누르면 말한 글이 그대로 타이핑되는 받아쓰기(dictation) 도구.** Orca의 voice처럼, 키보드 대신 음성으로 아무 창에나 입력. ChatGPT OAuth 그대로 사용 — API key 필요 없음.
+**Ctrl+E to dictate text into any window using Codex's realtime API.**
+**Ctrl+E를 누르면 말한 글이 커서 위치에 그대로 타이핑되는 받아쓰기 도구.**
 
-## 작동 방식
+A native desktop voice dictation tool built with Tauri + Rust. Uses Codex's experimental `thread/realtime` API with WebRTC transport and ChatGPT OAuth — no API key required.
 
-1. 앱이 백그라운드에서 codex app-server에 자동 연결 (ChatGPT OAuth).
-2. 아무 곳에서나 **Ctrl+E** 누르면 → 마이크 녹음 시작, 작은 pill 표시등이 화면 위에 나타남 ("듣는 중…").
-3. 말하면 실시간 전사가 pill에 표시됨 (한글/영어 자동 감지).
-4. 다시 **Ctrl+E** 누르면 → 녹음 종료, 전사된 텍스트가 커서 위치에 그대로 타이핑됨.
+ChatGPT OAuth로 작동하는 네이티브 데스크톱 받아쓰기 도구. Tauri + Rust로 제작. API key 불필요.
 
-codex의 실험용 `thread/realtime` API를 WebRTC 텍스트 모드로 구동합니다:
+---
+
+## How It Works / 작동 방식
 
 ```
-Ctrl+E → getUserMedia(mic) → RTCPeerConnection → SDP offer
-       → thread/realtime/start {transport:{type:"webrtc",sdp}, outputModality:"text", clientManagedHandoffs:true}
-       ← thread/realtime/transcript/delta (role:"user")  ← 실시간 전사 누적
-Ctrl+E → enigo.text(누적된 텍스트)  ← 커서 위치에 타이핑
+Ctrl+E → cpal (native mic capture, 24kHz mono)
+       → WebRTC RTCPeerConnection (webview)
+       → SDP offer → codex app-server (thread/realtime/start, WebRTC transport)
+       ← SDP answer (thread/realtime/sdp)
+       ← transcript deltas (role: user) → enigo.text() at cursor position
 ```
 
-## 요구사항
+1. App auto-connects to `codex app-server` on launch (ChatGPT OAuth).
+   앱 실행 시 codex app-server에 자동 연결 (ChatGPT OAuth).
+2. Press **Ctrl+E** anywhere → mic recording starts, pill indicator appears.
+   아무 곳에서나 **Ctrl+E** → 마이크 녹음 시작, pill 표시등 표시.
+3. Speak — live transcript appears in the pill (Korean/English auto-detect).
+   말하면 실시간 전사가 pill에 표시 (한글/영어 자동 감지).
+4. Press **Ctrl+E** again → transcribed text is typed at your cursor position.
+   다시 **Ctrl+E** → 전사된 텍스트가 커서 위치에 타이핑됨.
 
-- Codex CLI 설치 + ChatGPT 로그인 (`codex` on PATH, 또는 `C:\Users\<you>\.codex\packages\standalone\current\bin\codex.exe`에 자동 감지).
-- Rust 1.77+.
+---
 
-## 실행
+## Features / 기능
+
+| Feature | Description |
+|---------|-------------|
+| Native audio | `cpal` captures mic directly in Rust — no browser `getUserMedia` |
+| OAuth auth | Uses ChatGPT login via codex app-server — no API key needed |
+| 5-state pill UI | `hidden` → `recording` → `processing` → `success`/`error` with auto-hide |
+| Click-through | Pill never steals focus from your target window |
+| Hallucination filter | Filters empty transcripts and common Whisper hallucinations |
+| Korean + English | Auto-detects language; code-mixing (한영혼용) supported |
+| Never auto-Enter | Dictated text is typed; you decide when to press Enter |
+
+---
+
+## Requirements / 요구사항
+
+- [Codex CLI](https://github.com/openai/codex) installed and signed in with ChatGPT
+- Rust 1.77+ (for building from source)
+- Windows 10/11 (macOS/Linux should work but untested)
+
+---
+
+## Build / 빌드
 
 ```sh
 cd src-tauri
-cargo tauri dev      # 개발
-cargo tauri build    # 릴리스 exe → target/release/codex-mic.exe
+cargo tauri build
+# Output: src-tauri/target/release/codex-mic.exe
 ```
 
-빌드 후 `codex-mic.exe`를 실행하면 백그라운드에서 돌며 Ctrl+E로 받아쓰기.
-
-## 테스트
+## Run (dev) / 개발 실행
 
 ```sh
 cd src-tauri
-cargo test                          # 단위 테스트 (JSON-RPC 프레이밍 + 전사 role 필터)
-CODEX_MIC_INTEGRATION=1 cargo test  # 실제 codex 바이너리 통합 테스트 포함
+cargo tauri dev
 ```
 
-## 구조
+---
+
+## Configuration / 설정
+
+Change the hotkey in `src-tauri/src/lib.rs`:
+
+```rust
+const HOTKEY: &str = "Ctrl+E";  // e.g. "Alt+Space", "Ctrl+Shift+D"
+```
+
+---
+
+## Tests / 테스트
+
+```sh
+cd src-tauri
+cargo test                          # Unit tests (JSON-RPC framing, audio encoding, hallucination filter)
+CODEX_MIC_INTEGRATION=1 cargo test  # Integration test against real codex app-server
+```
+
+---
+
+## Architecture / 구조
 
 ```
 src-tauri/src/
-  jsonrpc.rs   — stdio JSON-RPC 클라이언트 + 프레이밍 (단위 테스트)
-  codex.rs     — 세션: app-server 스폰 → initialize → thread → realtime_start/stop
-  dictate.rs   — user-role 전사 누적 + enigo 키보드 주입 (단위 테스트)
-  commands.rs  — Tauri #[command] (realtime_start/stop, dictate_start/stop, buffer, status)
-  lib.rs       — Ctrl+E 글로벌 단축키 + 자동 연결 + 통합 테스트
-ui/            — 정적 웹뷰: 작은 pill 하나 (상태 표시등 + 실시간 전사 미리보기)
+  audio.rs     — Native mic capture via cpal (24kHz mono i16 → base64 PCM)
+  codex.rs     — codex app-server session: spawn, initialize, thread, realtime (WebRTC)
+  dictate.rs   — User-role transcript accumulator + enigo keyboard injection + hallucination filter
+  jsonrpc.rs   — Stdio JSON-RPC 2.0 client (newline-delimited, no "jsonrpc" field)
+  commands.rs  — Tauri #[command] interface (realtime_start, buffer, status, etc.)
+  lib.rs       — Global shortcut (Ctrl+E), toggle logic, auto-connect, integration tests
+ui/            — Static HTML/CSS/JS webview (5-state pill indicator)
 ```
 
-## 설정
+---
 
-단축키는 `src/lib.rs`의 `HOTKEY` 상수로 변경 가능 (`"Ctrl+E"`, `"Alt+Space"`, 등 — Tauri shortcut 문법).
+## How the realtime API works / realtime API 작동 방식
+
+This tool uses Codex's experimental `thread/realtime/*` JSON-RPC methods:
+
+| Method | Purpose |
+|--------|---------|
+| `thread/realtime/start` | Start a WebRTC realtime session with `{transport:{type:"webrtc",sdp}}` |
+| `thread/realtime/sdp` | Server returns the WebRTC answer SDP |
+| `thread/realtime/transcript/delta` | Live transcript text (filtered for `role:"user"`) |
+| `thread/realtime/stop` | End the realtime session |
+
+The app-server is launched with `--enable realtime_conversation` (experimental feature flag).
+Realtime calls are routed to `https://api.openai.com/v1` to bypass any custom chat-model proxy,
+so your ChatGPT OAuth token is used directly — same as the Codex desktop app.
+
+---
+
+## Acknowledgments / 참고
+
+Benchmarked against these excellent open-source dictation tools:
+- [VoiceType-AI](https://github.com/devaxl/VoiceType-AI) — 5-state HUD, safe injection pipeline
+- [dictation-tauri](https://github.com/nsimi22/dictation-tauri) — minimal Tauri pill UI
+- [Voicetypr](https://github.com/moinulmoin/voicetypr) — cross-platform Tauri dictation
+- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — the engine under most of these
+
+---
+
+## License
+
+MIT

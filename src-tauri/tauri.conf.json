@@ -19,9 +19,10 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "focus": false,
-        "visible": false,
+        "visible": true,
         "center": true,
-        "y": 40
+        "y": 40,
+        "hiddenTitle": true
       }
     ],
     "security": {

@@ -14,20 +14,28 @@ pub type Emitter = Arc<dyn Fn(&str, Value) + Send + Sync>;
 pub struct ConnectInfo {
     pub thread_id: String,
     pub user_agent: String,
-    pub codex_home: String,
     pub auth_mode: String,
 }
 
-const DEFAULT_CODEX: &str = r"C:\Users\hyeon\.codex\packages\standalone\current\bin\codex.exe";
+const DEFAULT_CODEX: &str = "codex";
 
 fn resolve_codex_bin() -> String {
     if let Ok(p) = std::env::var("CODEX_BIN") {
         return p;
     }
-    if PathBuf::from(DEFAULT_CODEX).exists() {
-        return DEFAULT_CODEX.to_string();
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let candidate = format!("{}\\.codex\\packages\\standalone\\current\\bin\\codex.exe", home);
+        if PathBuf::from(&candidate).exists() {
+            return candidate;
+        }
     }
-    "codex".to_string()
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = format!("{}/.codex/packages/standalone/current/bin/codex", home);
+        if PathBuf::from(&candidate).exists() {
+            return candidate;
+        }
+    }
+    DEFAULT_CODEX.to_string()
 }
 
 pub struct CodexSession {
@@ -90,11 +98,6 @@ impl CodexSession {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let codex_home = init
-            .get("codexHome")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         client.notify("initialized", json!({})).await?;
 
         let start = client
@@ -112,29 +115,24 @@ impl CodexSession {
         let info = ConnectInfo {
             thread_id: thread_id.clone(),
             user_agent,
-            codex_home,
             auth_mode,
         };
         Ok((Self { client, thread_id, _reader: reader, _forwarder: forwarder }, info))
     }
 
-    pub async fn realtime_start(&self) -> Result<(), RpcError> {
+    pub async fn realtime_start(&self, sdp_offer: String) -> Result<(), RpcError> {
         let params = json!({
             "threadId": self.thread_id,
             "outputModality": "text",
+            "transport": { "type": "webrtc", "sdp": sdp_offer },
             "clientManagedHandoffs": true,
         });
         let _ = self.client.request("thread/realtime/start", params).await?;
         Ok(())
     }
 
-    pub async fn append_audio(&self, base64_pcm: String) -> Result<(), RpcError> {
-        self.client
-            .request(
-                "thread/realtime/appendAudio",
-                json!({ "threadId": self.thread_id, "audio": { "data": base64_pcm, "sampleRate": 24000, "numChannels": 1 } }),
-            )
-            .await?;
+    #[allow(dead_code)]
+    pub async fn append_audio(&self, _base64_pcm: String) -> Result<(), RpcError> {
         Ok(())
     }
 

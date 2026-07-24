@@ -62,14 +62,14 @@ async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn realtime_start(state: State<'_, AppState>) -> Result<(), String> {
+async fn realtime_start(state: State<'_, AppState>, sdp_offer: String) -> Result<(), String> {
     let s = state
         .session
         .lock()
         .await
         .clone()
         .ok_or_else(|| "not connected".to_string())?;
-    s.realtime_start().await.map_err(err)
+    s.realtime_start(sdp_offer).await.map_err(err)
 }
 
 #[tauri::command]
