@@ -156,6 +156,12 @@ fn debounced() -> bool {
 /// let go" bug. Only a fresh press (down after up) may act.
 static DICTATION_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
+/// The user's *intent* to be recording, set on hotkey down and cleared on
+/// release. A quick tap makes Released arrive while start_dictation is still
+/// preparing (capture + reconnect can take seconds); without this flag the
+/// start would complete after the stop and leave a zombie recording.
+static INTENT_RECORDING: AtomicBool = AtomicBool::new(false);
+
 async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
     if TOGGLE_LOCK.swap(true, Ordering::SeqCst) {
         return;
@@ -175,6 +181,7 @@ async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
 }
 
 async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
+    info!("start_dictation: opening microphone");
     let state = app.state::<AppState>();
 
     // Open the microphone FIRST: cpal buffers into a channel while a (possibly
@@ -193,6 +200,7 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
     };
     *state.capture.lock().await = Some(capture);
 
+    info!("start_dictation: ensuring session");
     if let Err(e) = ensure_connected(app).await {
         if let Some(mut c) = state.capture.lock().await.take() {
             c.stop();
@@ -200,6 +208,7 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
         let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
         return;
     }
+    info!("start_dictation: session ready");
     let session = match state.session().await {
         Some(s) => s,
         None => {
@@ -226,6 +235,16 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
 
     let _ = app.emit("dictate://started", serde_json::json!({}));
     configure_overlay(window);
+
+    // The user may have released the hotkey while we were still preparing
+    // (capture + reconnect can take seconds). Honor the release: commit
+    // immediately instead of leaving a zombie recording.
+    if !INTENT_RECORDING.load(Ordering::SeqCst)
+        && config::get().activation_mode == config::ActivationMode::PushToTalk
+    {
+        info!("start_dictation: hotkey already released; committing");
+        stop_dictation(app).await;
+    }
 }
 
 /// Signals the currently running PCM pump to exit. Without this, every
@@ -455,12 +474,14 @@ pub fn run() {
                             if DICTATION_KEY_DOWN.swap(true, Ordering::SeqCst) {
                                 return; // auto-repeat while held
                             }
+                            INTENT_RECORDING.store(true, Ordering::SeqCst);
                             if !app.state::<AppState>().dictate.is_listening().await {
                                 start_dictation(&app, &window).await;
                             }
                         }
                         _ => {
                             DICTATION_KEY_DOWN.store(false, Ordering::SeqCst);
+                            INTENT_RECORDING.store(false, Ordering::SeqCst);
                             if app.state::<AppState>().dictate.is_listening().await {
                                 stop_dictation(&app).await;
                             }

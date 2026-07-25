@@ -380,9 +380,9 @@ impl RealtimeSession {
     }
 
     pub async fn disconnect(&self) {
-        if let Err(e) = self.pc.close().await {
-            warn!(error = %e, "peer connection close failed");
-        }
+        // A stale peer can hang on close (dead DTLS peer); never let cleanup
+        // block the next connect.
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.pc.close()).await;
     }
 }
 
@@ -392,7 +392,10 @@ async fn call_create(
     access_token: &str,
     account_id: &str,
 ) -> Result<(String, String), RpcError> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| RpcError::Spawn(format!("http client: {e}")))?;
     let res = client
         .post(CALLS_URL)
         .header("Authorization", format!("Bearer {access_token}"))
