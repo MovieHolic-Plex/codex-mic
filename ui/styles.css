@@ -2,27 +2,30 @@
 html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
 body {
   display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start;
-  font: 13px/1 "Segoe UI", system-ui, -apple-system, sans-serif;
+  font: 12px/1 "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 .pill {
-  display: flex; align-items: center; gap: 9px;
-  width: 100%; height: 56px; flex: 0 0 auto;
-  padding: 0 16px;
-  border-radius: 28px;
+  display: flex; align-items: center; gap: 7px;
+  width: 100%; height: 34px; flex: 0 0 auto;
+  padding: 0 10px;
+  border-radius: 17px;
   background: rgba(18, 22, 28, 0.92);
   border: 1px solid rgba(255,255,255,0.1);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
   backdrop-filter: blur(10px);
   color: #e6e9ee;
   user-select: none;
-  transition: border-color .2s, box-shadow .2s;
+  transition: border-color .2s, box-shadow .2s, opacity .2s;
 }
 
-.pill[data-state="hidden"] { opacity: 0.3; }
+/* Idle: get out of the way. Hovering brings it back so the controls are
+   reachable without having to remember they are there. */
+.pill[data-state="hidden"] { opacity: 0.28; }
+.pill[data-state="hidden"]:hover { opacity: 0.85; }
 .pill[data-state="recording"] {
   border-color: rgba(255, 90, 90, 0.7);
-  box-shadow: 0 0 0 1px rgba(255,90,90,.3), 0 8px 28px rgba(0,0,0,.5);
+  box-shadow: 0 0 0 1px rgba(255,90,90,.3), 0 4px 16px rgba(0,0,0,.5);
 }
 .pill[data-state="processing"] {
   border-color: rgba(255, 209, 102, 0.7);
@@ -35,7 +38,7 @@ body {
 }
 
 .dot {
-  width: 10px; height: 10px; border-radius: 50%;
+  width: 7px; height: 7px; border-radius: 50%;
   background: #5a6370; flex: 0 0 auto;
   transition: background .12s;
 }
@@ -48,8 +51,8 @@ body {
 .pill[data-state="error"] .dot { background: #ff6b6b; }
 
 @keyframes pulse {
-  0%, 100% { box-shadow: 0 0 0 4px rgba(255, 90, 90, 0.18); }
-  50% { box-shadow: 0 0 0 7px rgba(255, 90, 90, 0.06); }
+  0%, 100% { box-shadow: 0 0 0 3px rgba(255, 90, 90, 0.18); }
+  50% { box-shadow: 0 0 0 5px rgba(255, 90, 90, 0.06); }
 }
 
 .label {
@@ -59,13 +62,18 @@ body {
   cursor: move;
 }
 
+/* The gear and the quit button are chrome, not content: they fade back so the
+   pill reads as a status light, and come forward on hover. */
 .pill-btn {
   flex: 0 0 auto;
   background: none; border: none;
-  color: #8a93a2; font-size: 13px;
-  cursor: pointer; padding: 3px 5px;
-  border-radius: 6px;
+  color: #8a93a2; font-size: 11px;
+  cursor: pointer; padding: 2px 4px;
+  border-radius: 5px;
+  opacity: .5;
+  transition: opacity .15s, color .15s;
 }
+.pill:hover .pill-btn { opacity: 1; }
 .pill-btn:hover { color: #e6e9ee; background: rgba(255,255,255,0.08); }
 
 .foot-btns { display: flex; gap: 8px; }
@@ -81,6 +89,10 @@ body {
 
 .settings {
   flex: 1 1 auto;
+  /* Flex items default to min-width:auto; without this a long enough <option>
+     or transcript would push the panel past the window edge instead of
+     ellipsizing inside it. */
+  min-width: 0;
   display: flex; flex-direction: column; gap: 10px;
   margin-top: 8px;
   padding: 14px 16px;
@@ -108,10 +120,12 @@ body {
 
 .row {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  min-width: 0;
 }
-.row > span { color: #aab2bf; flex: 0 0 auto; }
+/* A fixed label column so every control starts at the same x. */
+.row > span { color: #aab2bf; flex: 0 0 112px; }
 .row input[type="text"], .row select {
-  flex: 1 1 auto; min-width: 0;
+  flex: 1 1 auto; min-width: 0; width: 100%;
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: 8px;
@@ -124,17 +138,25 @@ body {
 }
 .row select option { background: #12161c; }
 
+/* Checkbox rows read as one sentence, so their label is not part of the
+   fixed label column. */
 .row.check { justify-content: flex-start; gap: 8px; cursor: pointer; }
-.row.check input { accent-color: #7ef0c0; }
+.row.check > span { flex: 0 1 auto; }
+.row.check input { accent-color: #7ef0c0; flex: 0 0 auto; }
 
 .settings-foot {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  min-width: 0;
   margin-top: auto;
   padding-top: 8px;
   border-top: 1px solid rgba(255,255,255,0.08);
 }
 
-.status { color: #8a93a2; font-size: 12px; }
+.status {
+  color: #8a93a2; font-size: 11px;
+  flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 .save-btn {
   background: #7ef0c0; color: #10231b;
@@ -146,8 +168,8 @@ body {
 .save-btn:hover { background: #96f5cd; }
 
 .meter {
-  flex: 0 0 48px; height: 6px;
-  border-radius: 3px;
+  flex: 0 0 36px; height: 4px;
+  border-radius: 2px;
   background: rgba(255,255,255,0.08);
   overflow: hidden;
   display: none;

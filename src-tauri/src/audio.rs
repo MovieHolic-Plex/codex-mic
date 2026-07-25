@@ -472,4 +472,34 @@ mod tests {
         );
         eprintln!("[mic] device released cleanly after stop()");
     }
+
+    /// The commit path drains the capture *after* releasing the device, to pick
+    /// up everything cpal buffered since the pump's last 50 ms tick. If stop()
+    /// dropped that audio the last syllable of every dictation would be lost —
+    /// which is exactly what used to happen.
+    #[test]
+    fn buffered_audio_survives_stop_and_can_still_be_drained() {
+        if std::env::var("CODEX_MIC_AUDIO").is_err() {
+            eprintln!("skipping; set CODEX_MIC_AUDIO=1 to run against a real mic");
+            return;
+        }
+        let mut capture = AudioCapture::start(None).expect("microphone should open");
+        // Deliberately do not drain while recording: this stands in for the
+        // audio captured between the pump's last tick and the key coming up.
+        std::thread::sleep(Duration::from_millis(400));
+        capture.stop();
+
+        let tail = capture
+            .read_pending_bytes()
+            .expect("audio buffered before stop() must still be drainable after it");
+        eprintln!("[mic] recovered {} bytes of tail after stop()", tail.len());
+        assert_eq!(tail.len() % 2, 0, "PCM16 must be an even byte count");
+        // 400ms at 48kHz mono PCM16 is ~38400 bytes; allow generous slack for
+        // device start-up latency.
+        assert!(
+            tail.len() > 8_000,
+            "only {} bytes recovered — the tail is being dropped",
+            tail.len()
+        );
+    }
 }

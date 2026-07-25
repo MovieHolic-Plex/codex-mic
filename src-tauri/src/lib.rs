@@ -6,10 +6,13 @@ mod dictate;
 mod error;
 #[allow(dead_code)] // PCMU fallback path kept from the codec probes
 mod g711;
+mod keystate;
 mod realtime;
+mod winkeys;
 
 use commands::AppState;
 use dictate::Committed;
+use keystate::Action;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,12 +20,19 @@ use tauri::{Emitter, Manager, WebviewWindow};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tracing::{error, info, warn};
 
-const DEBOUNCE: Duration = Duration::from_millis(400);
 const PCM_PUMP_INTERVAL: Duration = Duration::from_millis(50);
-/// Pill height in its collapsed state; the settings panel expands it.
-const PILL_HEIGHT: f64 = 56.0;
+/// Digital silence appended after the last captured sample so the server-side
+/// VAD sees the end of the utterance instead of a stream that simply stops.
+const SILENCE_TAIL: Duration = Duration::from_millis(400);
+/// Pill geometry. The window is sized to the pill exactly — a transparent
+/// window is still hit-testable, so any slack around the pill would swallow
+/// clicks meant for the app underneath.
+const PILL_HEIGHT: f64 = 34.0;
+const PILL_WIDTH: f64 = 300.0;
+/// The settings panel needs room the pill does not, so opening it grows the
+/// window in both directions.
 const SETTINGS_HEIGHT: f64 = 620.0;
-const WINDOW_WIDTH: f64 = 420.0;
+const SETTINGS_WIDTH: f64 = 420.0;
 
 fn configured_hotkeys() -> Option<(Shortcut, Shortcut)> {
     let cfg = config::get();
@@ -43,6 +53,9 @@ pub fn apply_hotkeys(app: &tauri::AppHandle) -> Result<(), String> {
         .ok_or_else(|| "hotkeys are invalid or identical".to_string())?;
     gs.register(dictation).map_err(|e| format!("register dictation hotkey: {e}"))?;
     gs.register(settings).map_err(|e| format!("register settings hotkey: {e}"))?;
+    // Hotkey changes happen from the settings panel, i.e. between dictations —
+    // the only moment the caps baseline can be sampled honestly.
+    init_caps_baseline(app);
     Ok(())
 }
 
@@ -66,7 +79,7 @@ pub fn set_settings_open(app: &tauri::AppHandle, open: bool) {
     if open {
         let _ = window.set_focusable(true);
         let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
-            width: WINDOW_WIDTH,
+            width: SETTINGS_WIDTH,
             height: SETTINGS_HEIGHT,
         }));
         let _ = window.set_focus();
@@ -74,7 +87,7 @@ pub fn set_settings_open(app: &tauri::AppHandle, open: bool) {
     } else {
         let _ = app.emit("settings://close", serde_json::json!({}));
         let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize {
-            width: WINDOW_WIDTH,
+            width: PILL_WIDTH,
             height: PILL_HEIGHT,
         }));
         let _ = window.set_focusable(false);
@@ -127,83 +140,78 @@ fn make_emitter(app: &tauri::AppHandle) -> crate::realtime::Emitter {
     })
 }
 
-static TOGGLE_LOCK: AtomicBool = AtomicBool::new(false);
-static LAST_TOGGLE: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+/// The caps state the user is entitled to have, sampled while *not* dictating.
+///
+/// It has to be sampled outside a dictation: by the time our hotkey handler
+/// runs, the key-down that triggered it may already have flipped the toggle
+/// bit, so a snapshot taken at the start of a recording can read the flipped
+/// value and the comparison at commit time would see "nothing changed".
+///
+/// Comparing against this baseline is right whatever Windows does with a
+/// swallowed CapsLock: one flip per press (push-to-talk) is corrected, two
+/// flips (toggle mode's start and stop presses) cancel out and are left alone,
+/// and zero flips need nothing. The old code sent exactly one compensating
+/// click unconditionally, which inverted caps on every toggle-mode dictation
+/// and on every aborted one.
+///
+/// `None` means "not our business" — the dictation hotkey is not CapsLock.
+static CAPS_BASELINE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
-struct ToggleGuard;
-impl Drop for ToggleGuard {
-    fn drop(&mut self) {
-        TOGGLE_LOCK.store(false, Ordering::SeqCst);
+fn caps_baseline() -> &'static std::sync::Mutex<Option<bool>> {
+    &CAPS_BASELINE
+}
+
+/// Run a closure on the UI thread.
+///
+/// `GetKeyState` reports the keyboard state as of the last message the calling
+/// thread pulled from its queue, so a tokio worker — which pumps no messages —
+/// can read a stale caps toggle bit. The main thread runs the event loop, so
+/// both the read and the corrective keystroke belong there.
+fn on_main_thread(app: &tauri::AppHandle, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = app.run_on_main_thread(f) {
+        warn!(error = %e, "could not reach the main thread for caps handling");
     }
 }
 
-fn debounced() -> bool {
-    let last = LAST_TOGGLE.get_or_init(|| std::sync::Mutex::new(Instant::now() - Duration::from_secs(10)));
-    let mut l = match last.lock() {
-        Ok(l) => l,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if l.elapsed() < DEBOUNCE {
-        return true;
-    }
-    *l = Instant::now();
-    false
+/// (Re)sample the baseline. Safe only between dictations — called at startup
+/// and whenever the hotkey changes.
+fn init_caps_baseline(app: &tauri::AppHandle) {
+    let is_capslock = keystate::hotkey_is_capslock(&config::get().hotkey);
+    on_main_thread(app, move || {
+        let sampled = if is_capslock { winkeys::caps_on() } else { None };
+        info!(?sampled, "caps baseline sampled");
+        *caps_baseline()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sampled;
+    });
 }
 
-/// Tracks whether the dictation hotkey is physically held. Windows auto-repeat
-/// re-fires global hotkeys while a key is held, which in toggle mode made the
-/// recording strobe on/off during a single long press — the "canceled when I
-/// let go" bug. Only a fresh press (down after up) may act.
-static DICTATION_KEY_DOWN: AtomicBool = AtomicBool::new(false);
-
-/// The user's *intent* to be recording, set on hotkey down and cleared on
-/// release. A quick tap makes Released arrive while start_dictation is still
-/// preparing (capture + reconnect can take seconds); without this flag the
-/// start would complete after the stop and leave a zombie recording.
-static INTENT_RECORDING: AtomicBool = AtomicBool::new(false);
-
-async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
-    if TOGGLE_LOCK.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let _guard = ToggleGuard;
-    if debounced() {
-        return;
-    }
-
-    if app.state::<AppState>().dictate.is_listening().await {
-        // Stop must never block on connecting — otherwise a slow or hung
-        // connect leaves the user stuck in the recording state.
-        stop_dictation(&app).await;
-    } else {
-        start_dictation(&app, &window).await;
-    }
-}
-
-/// After a CapsLock-initiated dictation, send exactly one compensating click.
-/// Holding the hotkey toggles caps state exactly once (RegisterHotKey swallows
-/// the keystroke but not the toggle), so one click always restores it — no
-/// state reading needed. The injected press re-enters our hotkey handler but
-/// is swallowed by the repeat guard (DICTATION_KEY_DOWN pre-set); the release
-/// finds nothing listening.
-fn restore_caps_state_if_needed() {
-    let cfg = config::get();
-    let is_capslock = cfg
-        .hotkey
-        .trim()
-        .parse::<Shortcut>()
-        .map(|s| format!("{s:?}").contains("CapsLock"))
-        .unwrap_or(false);
-    if !is_capslock {
-        return;
-    }
-    info!("restoring caps lock state");
-    DICTATION_KEY_DOWN.store(true, Ordering::SeqCst);
-    tokio::task::spawn_blocking(|| {
-        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-        if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-            let _ = enigo.key(Key::CapsLock, Direction::Click);
+/// Put CapsLock back the way the user had it.
+///
+/// Called at the very top of the commit — microseconds after the physical key
+/// came up, long before the transcript wait and the injection. Doing it last
+/// (as this used to) opened a window hundreds of milliseconds wide in which the
+/// user's next press was eaten by the guard that hides our own injected tap.
+fn restore_caps_state(app: &tauri::AppHandle) {
+    on_main_thread(app, || {
+        // The lock is held across the tap so two commits cannot both decide to
+        // correct the same drift.
+        let baseline = caps_baseline()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = winkeys::caps_on();
+        if !keystate::caps_restore_needed(*baseline, now) {
+            return;
         }
+        info!(?baseline, ?now, "restoring caps lock state");
+        // RegisterHotKey sees injected input, so the tap comes straight back as
+        // a press+release pair on our own hotkey. Ignore hotkey traffic
+        // briefly; the window is short enough that a real key press cannot fit
+        // inside it.
+        keystate::suppress_for(keystate::SYNTHETIC_SUPPRESS);
+        winkeys::tap_capslock();
+        // The baseline stands: the tap is what makes reality match it again. If
+        // it somehow does not land, the next commit simply tries again.
     });
 }
 
@@ -221,8 +229,7 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "audio capture failed");
-            let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
-            return;
+            return fail_start(app, e);
         }
     };
     *state.capture.lock().await = Some(capture);
@@ -235,52 +242,79 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
 
     info!("start_dictation: ensuring session");
     if let Err(e) = ensure_connected(app).await {
-        if let Some(mut c) = state.capture.lock().await.take() {
-            c.stop();
-        }
-        let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
-        return;
+        release_capture(app).await;
+        return fail_start(app, e);
     }
     info!("start_dictation: session ready");
     let session = match state.session().await {
         Some(s) => s,
         None => {
-            if let Some(mut c) = state.capture.lock().await.take() {
-                c.stop();
-            }
-            let _ = app.emit("dictate://error", serde_json::json!({ "message": "not connected" }));
-            return;
+            release_capture(app).await;
+            return fail_start(app, "not connected".to_string());
         }
     };
 
-    if let Err(e) = state.dictate.start_listening(&session).await {
-        if let Some(mut c) = state.capture.lock().await.take() {
-            c.stop();
-        }
-        let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
-        return;
+    if let Err(e) = state.dictate.start_listening(session.subscribe()).await {
+        release_capture(app).await;
+        return fail_start(app, e);
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     PEAK_RMS.store(0, Ordering::SeqCst);
-    spawn_pcm_pump(app.clone(), session, stop_flag.clone());
-    PUMP_STOP.lock().unwrap().replace(stop_flag);
+    let join = spawn_pcm_pump(app.clone(), session, stop_flag.clone());
+    *PUMP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Pump { stop: stop_flag, join });
 
-    // The user may have released the hotkey while we were still preparing
-    // (capture + reconnect can take seconds). Honor the release: commit
-    // immediately instead of leaving a zombie recording.
-    if !INTENT_RECORDING.load(Ordering::SeqCst)
-        && config::get().activation_mode == config::ActivationMode::PushToTalk
-    {
+    // The user may have let go while we were still preparing (capture +
+    // reconnect can take seconds). The machine remembered that release; honor
+    // it now instead of leaving a zombie recording running.
+    if keystate::with(|m| m.started()) == Action::Stop {
         info!("start_dictation: hotkey already released; committing");
         stop_dictation(app).await;
     }
 }
 
-/// Signals the currently running PCM pump to exit. Without this, every
-/// recording left a pump task alive for the process lifetime, and after N
-/// dictations N pumps would emit the same audio N times over.
-static PUMP_STOP: std::sync::Mutex<Option<Arc<AtomicBool>>> = std::sync::Mutex::new(None);
+/// Roll the lifecycle back to idle and show why the recording never started.
+///
+/// The press that got us here may already have flipped caps, so that is undone
+/// too — a failed start used to leave CapsLock stuck on.
+fn fail_start(app: &tauri::AppHandle, message: String) {
+    keystate::with(|m| m.start_failed());
+    restore_caps_state(app);
+    let _ = app.emit("dictate://error", serde_json::json!({ "message": message }));
+}
+
+async fn release_capture(app: &tauri::AppHandle) {
+    if let Some(mut c) = app.state::<AppState>().capture.lock().await.take() {
+        c.stop();
+    }
+}
+
+/// The currently running PCM pump. Without this, every recording left a pump
+/// task alive for the process lifetime, and after N dictations N pumps would
+/// emit the same audio N times over.
+struct Pump {
+    stop: Arc<AtomicBool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+static PUMP: std::sync::Mutex<Option<Pump>> = std::sync::Mutex::new(None);
+
+fn take_pump() -> Option<Pump> {
+    PUMP.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Stop the pump and wait for it to actually be gone, so nothing else is
+/// writing to the audio track while the tail is flushed.
+async fn halt_pump() {
+    if let Some(pump) = take_pump() {
+        pump.stop.store(true, Ordering::SeqCst);
+        let _ = pump.join.await;
+    }
+}
 
 /// Peak mic RMS of the current recording, updated by the pump. Read on stop to
 /// distinguish "you said nothing" from "your microphone delivered silence" —
@@ -304,7 +338,7 @@ fn spawn_pcm_pump(
     app: tauri::AppHandle,
     session: Arc<crate::realtime::RealtimeSession>,
     stop: Arc<AtomicBool>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let cfg = config::get();
         let autostop = if cfg.silence_autostop_ms > 0 {
@@ -323,6 +357,9 @@ fn spawn_pcm_pump(
         let mut last_rms_log = Instant::now() - Duration::from_secs(10);
         let mut interval = tokio::time::interval(PCM_PUMP_INTERVAL);
         interval.tick().await;
+        // Set when the stream died under us: there is no usable transcript, so
+        // the recording is discarded rather than committed.
+        let mut fatal = false;
         while !stop.load(Ordering::SeqCst) {
             interval.tick().await;
             let chunk = if let Some(pcm) = &debug_pcm {
@@ -360,14 +397,29 @@ fn spawn_pcm_pump(
             if let Err(e) = session.append_pcm(&bytes).await {
                 warn!(error = %e, "append_pcm failed; stopping stream");
                 let _ = app.emit("dictate://error", serde_json::json!({ "message": e.to_string() }));
-                return;
+                fatal = true;
+                break;
             }
         }
-        // Out of the loop by silence, not by hotkey: commit like a manual stop.
-        if !stop.load(Ordering::SeqCst) {
-            stop_dictation(&app).await;
+        // Asked to stop by the commit path: it owns the teardown from here.
+        if stop.load(Ordering::SeqCst) {
+            return;
         }
-    });
+        // We left on our own — silence auto-stop, a capture that vanished, or a
+        // dead stream. Retire our own handle first, or the teardown would await
+        // this very task from inside it, and drop the microphone either way: a
+        // failed append used to return here and leave it live indefinitely.
+        if let Some(pump) = take_pump() {
+            pump.stop.store(true, Ordering::SeqCst);
+        }
+        if keystate::with(|m| m.stop_requested()) == Action::Stop {
+            if fatal {
+                abort_dictation(&app).await;
+            } else {
+                stop_dictation(&app).await;
+            }
+        }
+    })
 }
 
 /// If the realtime session fails server-side (quota exhausted, auth expired,
@@ -381,7 +433,7 @@ fn spawn_realtime_failure_watchdog(app: tauri::AppHandle, session: &Arc<crate::r
         loop {
             match rx.recv().await {
                 Ok(n) if n.method == "thread/realtime/error" => {
-                    if app.state::<AppState>().dictate.is_listening().await {
+                    if keystate::with(|m| m.stop_requested()) == Action::Stop {
                         warn!("realtime session failed; releasing microphone");
                         abort_dictation(&app).await;
                     }
@@ -397,28 +449,46 @@ fn spawn_realtime_failure_watchdog(app: tauri::AppHandle, session: &Arc<crate::r
 /// Stop recording and discard the buffer without typing or emitting a
 /// `stopped` event — the error already on screen must stay visible.
 async fn abort_dictation(app: &tauri::AppHandle) {
-    let state = app.state::<AppState>();
-    if let Some(flag) = PUMP_STOP.lock().unwrap().take() {
-        flag.store(true, Ordering::SeqCst);
-    }
-    if let Some(mut c) = state.capture.lock().await.take() {
-        c.stop();
-    }
-    state.dictate.abort().await;
-    restore_caps_state_if_needed();
+    restore_caps_state(app);
+    halt_pump().await;
+    release_capture(app).await;
+    app.state::<AppState>().dictate.abort().await;
+    keystate::with(|m| m.stopped());
 }
 
 async fn stop_dictation(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     let _ = app.emit("dictate://processing", serde_json::json!({}));
+    // First thing, while the key has only just come up: anything later races
+    // the user's next press.
+    restore_caps_state(app);
 
-    if let Some(flag) = PUMP_STOP.lock().unwrap().take() {
-        flag.store(true, Ordering::SeqCst);
+    halt_pump().await;
+
+    // Hand over the audio the pump never got to: everything cpal buffered
+    // since its last 50 ms tick, plus the partial Opus frame the encoder is
+    // holding, plus a beat of silence to close the turn. Without this the last
+    // syllable of every dictation was captured and then thrown away.
+    let session = state.session().await;
+    if let Some(mut capture) = state.capture.lock().await.take() {
+        if let Some(s) = &session {
+            if let Some(bytes) = capture.read_pending_bytes() {
+                let _ = s.append_pcm(&bytes).await;
+            }
+        }
+        // Release the microphone: the user pressed stop, the mic indicator
+        // should go out now regardless of what the server does next.
+        capture.stop();
+        if let Some(s) = &session {
+            if let Some(bytes) = capture.read_pending_bytes() {
+                let _ = s.append_pcm(&bytes).await;
+            }
+        }
     }
-    // Release the microphone first: the user pressed stop, the mic indicator
-    // should go out immediately regardless of what the server does next.
-    if let Some(mut c) = state.capture.lock().await.take() {
-        c.stop();
+    if let Some(s) = &session {
+        if let Err(e) = s.flush_tail(SILENCE_TAIL).await {
+            warn!(error = %e, "tail flush failed");
+        }
     }
 
     match state.dictate.stop_listening().await {
@@ -452,7 +522,7 @@ async fn stop_dictation(app: &tauri::AppHandle) {
             let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
         }
     }
-    restore_caps_state_if_needed();
+    keystate::with(|m| m.stopped());
 }
 
 pub fn run() {
@@ -482,43 +552,34 @@ pub fn run() {
             if shortcut != &dictation {
                 return;
             }
+            // Our own caps-restore tap comes back through RegisterHotKey.
+            if keystate::suppressed() {
+                return;
+            }
+
+            // One decision, made synchronously. Doing this inside the spawned
+            // task instead let a press and its release be reordered, and let
+            // two presses both decide to start.
+            let action = match event.state {
+                ShortcutState::Pressed => keystate::with(|m| m.press(cfg.activation_mode)),
+                _ => keystate::with(|m| m.release()),
+            };
+            if action == Action::Ignore {
+                return;
+            }
 
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let Some(window) = app.get_webview_window("main") else {
                     warn!("main window not found");
+                    // Never strand the machine mid-transition.
+                    keystate::with(|m| m.stopped());
                     return;
                 };
-                match cfg.activation_mode {
-                    config::ActivationMode::Toggle => match event.state {
-                        ShortcutState::Pressed => {
-                            if DICTATION_KEY_DOWN.swap(true, Ordering::SeqCst) {
-                                return; // auto-repeat while held
-                            }
-                            toggle(app, window).await;
-                        }
-                        _ => {
-                            DICTATION_KEY_DOWN.store(false, Ordering::SeqCst);
-                        }
-                    },
-                    config::ActivationMode::PushToTalk => match event.state {
-                        ShortcutState::Pressed => {
-                            if DICTATION_KEY_DOWN.swap(true, Ordering::SeqCst) {
-                                return; // auto-repeat while held
-                            }
-                            INTENT_RECORDING.store(true, Ordering::SeqCst);
-                            if !app.state::<AppState>().dictate.is_listening().await {
-                                start_dictation(&app, &window).await;
-                            }
-                        }
-                        _ => {
-                            DICTATION_KEY_DOWN.store(false, Ordering::SeqCst);
-                            INTENT_RECORDING.store(false, Ordering::SeqCst);
-                            if app.state::<AppState>().dictate.is_listening().await {
-                                stop_dictation(&app).await;
-                            }
-                        }
-                    },
+                match action {
+                    Action::Start => start_dictation(&app, &window).await,
+                    Action::Stop => stop_dictation(&app).await,
+                    Action::Ignore => {}
                 }
             });
         })

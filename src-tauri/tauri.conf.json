@@ -11,8 +11,8 @@
       {
         "label": "main",
         "title": "Codex Mic",
-        "width": 420,
-        "height": 56,
+        "width": 300,
+        "height": 34,
         "resizable": false,
         "decorations": false,
         "transparent": true,

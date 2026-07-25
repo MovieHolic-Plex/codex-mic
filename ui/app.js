@@ -7,8 +7,11 @@ const { listen } = window.__TAURI__.event;
 
 const label = document.getElementById("label");
 const pill = document.getElementById("pill");
+const meterFill = document.getElementById("meter-fill");
 const settings = document.getElementById("settings");
 const settingsStatus = document.getElementById("settings-status");
+
+const DEFAULT_HOTKEY = "Ctrl+E";
 
 let hideTimer = null;
 let unlisteners = [];
@@ -18,10 +21,24 @@ let settingsOpen = false;
 function setState(state, text) {
   pill.dataset.state = state;
   label.textContent = text;
+  if (state !== "recording") setLevel(0);
   if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
-  const idle = () => { pill.dataset.state = "hidden"; label.textContent = config?.hotkey || "Ctrl+E"; };
+  const idle = () => { pill.dataset.state = "hidden"; label.textContent = config?.hotkey || DEFAULT_HOTKEY; };
   if (state === "success") hideTimer = setTimeout(idle, 1500);
   else if (state === "error") hideTimer = setTimeout(idle, 5000);
+}
+
+// Mic level meter. RMS arrives on an i16 scale where speech sits far below
+// full scale, so a square-root curve is what makes normal talking fill a
+// useful part of the bar instead of a sliver. Decay is capped per frame so the
+// bar reads as a level, not a strobe.
+let level = 0;
+function setLevel(pct) {
+  level = pct >= level ? pct : Math.max(pct, level - 12);
+  meterFill.style.width = `${level}%`;
+}
+function levelFromRms(rms) {
+  return Math.min(100, Math.round(Math.sqrt(Math.max(0, rms) / 12000) * 100));
 }
 
 async function setupListeners() {
@@ -29,11 +46,14 @@ async function setupListeners() {
   unlisteners = [];
   const subs = [
     ["dictate://started", () => setState("recording", "듣는 중…")],
+    ["dictate://level", (e) => {
+      if (pill.dataset.state === "recording") setLevel(levelFromRms(e.payload?.rms ?? 0));
+    }],
     ["dictate://processing", () => setState("processing", "변환 중…")],
     ["dictate://stopped", (e) => {
       const text = e.payload?.text || "";
       if (text) setState("success", `✓ ${text.slice(0, 60)}`);
-      else setState("hidden", config?.hotkey || "Ctrl+E");
+      else setState("hidden", config?.hotkey || DEFAULT_HOTKEY);
     }],
     ["dictate://filtered", (e) => {
       const text = e.payload?.text || "";
@@ -100,7 +120,7 @@ fields.injectionMode.addEventListener("change", syncInjectionRow);
 
 function readForm() {
   return {
-    hotkey: fields.hotkey.value.trim() || "Ctrl+E",
+    hotkey: fields.hotkey.value.trim() || DEFAULT_HOTKEY,
     settings_hotkey: fields.settingsHotkey.value.trim() || "Ctrl+Shift+E",
     activation_mode: fields.activationMode.value,
     silence_autostop_ms: parseInt(fields.silenceAutostop.value, 10) || 0,
@@ -188,7 +208,7 @@ document.getElementById("save-settings").addEventListener("click", async () => {
 async function init() {
   await setupListeners();
   try { config = await invoke("get_config"); } catch {}
-  setState("hidden", config?.hotkey || "Ctrl+E");
+  setState("hidden", config?.hotkey || DEFAULT_HOTKEY);
   try {
     if (!(await invoke("has_oauth"))) {
       setState("error", "⚠ codex login 필요");
@@ -203,7 +223,9 @@ setInterval(async () => {
   if (settingsOpen) return;
   if (pill.dataset.state !== "recording") return;
   try {
+    // The pill is deliberately narrow now, so show the tail of the transcript
+    // — the words just spoken — rather than a truncated beginning.
     const b = await invoke("buffer");
-    label.textContent = b ? (b.length > 80 ? b.slice(-80) : b) : "듣는 중…";
+    label.textContent = b ? (b.length > 48 ? b.slice(-48) : b) : "듣는 중…";
   } catch {}
 }, 200);

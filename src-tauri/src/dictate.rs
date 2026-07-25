@@ -1,14 +1,74 @@
 use crate::config::{self, InjectionMode};
 use crate::error::RpcError;
-use crate::realtime::{Notification, RealtimeSession};
+use crate::realtime::Notification;
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-type SharedBuf = Arc<Mutex<String>>;
+/// How long the target app is given to release its modifiers before we type.
+const MODIFIER_GRACE: Duration = Duration::from_millis(600);
+
+/// Everything the accumulator has heard about the current dictation.
+#[derive(Debug, Default)]
+struct Incoming {
+    /// Concatenated `transcript/delta` fragments.
+    text: String,
+    /// The authoritative full transcript from `turn.done`, when it arrives.
+    done: Option<String>,
+    /// When the last transcript event landed — drives the quiet-window commit.
+    last: Option<Instant>,
+    /// Whether any transcript event arrived at all this dictation.
+    seen: bool,
+}
+
+impl Incoming {
+    fn mark(&mut self) {
+        self.seen = true;
+        self.last = Some(Instant::now());
+    }
+
+    /// The best transcript available: `turn.done` if the server sent one,
+    /// otherwise the accumulated deltas.
+    fn resolve(self) -> String {
+        self.done.unwrap_or(self.text)
+    }
+}
+
+type Shared = Arc<Mutex<Incoming>>;
+
+/// How long a commit waits for the transcript after the audio stops.
+///
+/// Transcription lags speech: the server only emits the tail of an utterance
+/// (and `turn.done`) after the audio has drained through its VAD. Committing
+/// the instant the key comes up — what this used to do — truncated the last
+/// words of every dictation and returned nothing at all for short ones.
+#[derive(Debug, Clone, Copy)]
+pub struct Timings {
+    /// Hard ceiling on the wait.
+    pub deadline: Duration,
+    /// Commit once the transcript has been quiet this long.
+    pub quiet: Duration,
+    /// Give up early if not one transcript event ever arrived.
+    pub no_event: Duration,
+    /// Poll granularity.
+    pub poll: Duration,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_millis(3500),
+            quiet: Duration::from_millis(900),
+            no_event: Duration::from_millis(1500),
+            poll: Duration::from_millis(25),
+        }
+    }
+}
 
 const HALLUCINATION_PATTERNS: &[&str] = &[
     "thank you for watching",
@@ -30,7 +90,7 @@ const SHORT_TRANSCRIPT_CHARS: usize = 80;
 /// nothing" from "we threw your words away".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Committed {
-    /// Text was sanitized and typed at the cursor.
+    /// Text was sanitized and (by `stop_listening`) typed at the cursor.
     Typed(String),
     /// Nothing was transcribed.
     Empty,
@@ -39,7 +99,7 @@ pub enum Committed {
 }
 
 pub struct DictateState {
-    buffer: SharedBuf,
+    incoming: Shared,
     listening: Mutex<bool>,
     accumulator: Mutex<Option<JoinHandle<()>>>,
 }
@@ -47,7 +107,7 @@ pub struct DictateState {
 impl DictateState {
     pub fn new() -> Self {
         Self {
-            buffer: Arc::new(Mutex::new(String::new())),
+            incoming: Arc::new(Mutex::new(Incoming::default())),
             listening: Mutex::new(false),
             accumulator: Mutex::new(None),
         }
@@ -57,28 +117,55 @@ impl DictateState {
         *self.listening.lock().await
     }
 
-    /// Begin accumulating user-role transcript deltas from `session`.
+    /// Begin accumulating user-role transcript events from `rx`.
     ///
     /// Any accumulator left over from a previous run is aborted first: leaking
     /// them makes every delta land in the shared buffer once per past session,
     /// which duplicates the transcript.
-    pub async fn start_listening(&self, session: &Arc<RealtimeSession>) -> Result<(), String> {
+    pub async fn start_listening(&self, rx: broadcast::Receiver<Notification>) -> Result<(), String> {
         self.abort_accumulator().await;
-        self.buffer.lock().await.clear();
+        *self.incoming.lock().await = Incoming::default();
         *self.listening.lock().await = true;
-        let rx = session.subscribe();
-        let buf = self.buffer.clone();
-        *self.accumulator.lock().await = Some(tokio::spawn(accumulate_loop(rx, buf)));
+        let incoming = self.incoming.clone();
+        *self.accumulator.lock().await = Some(tokio::spawn(accumulate_loop(rx, incoming)));
         Ok(())
     }
 
+    /// Settle the transcript and inject it at the cursor.
     pub async fn stop_listening(&self) -> Result<Committed, String> {
+        let outcome = self.finish(Timings::default()).await?;
+        if let Committed::Typed(text) = &outcome {
+            // enigo drives SendInput and arboard talks to the OS clipboard —
+            // both block; never run them on an async worker.
+            let to_inject = text.clone();
+            tokio::task::spawn_blocking(move || inject_text(&to_inject))
+                .await
+                .map_err(|e| format!("injection task failed: {e}"))?
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(outcome)
+    }
+
+    /// Wait for the transcript to settle, then filter and sanitize it.
+    ///
+    /// Resolution only — injection is [`Self::stop_listening`]'s job, so tests
+    /// can exercise the whole timing path without typing into the developer's
+    /// screen.
+    ///
+    /// The wait ends at the first of: `turn.done` arriving, the transcript
+    /// going quiet for `quiet` with text in hand, `no_event` passing with
+    /// nothing heard at all, or the hard `deadline`. When no accumulator is
+    /// running there is nothing to wait for and the commit is immediate.
+    pub async fn finish(&self, t: Timings) -> Result<Committed, String> {
         *self.listening.lock().await = false;
+        if self.accumulator.lock().await.is_some() {
+            self.await_transcript(t).await;
+        }
         self.abort_accumulator().await;
 
-        // Single lock acquisition: taking the string and clearing it in two
+        // Single lock acquisition: taking the transcript and clearing it in two
         // separate locks lets a delta land in between and be silently dropped.
-        let text = std::mem::take(&mut *self.buffer.lock().await);
+        let text = std::mem::take(&mut *self.incoming.lock().await).resolve();
 
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -93,15 +180,37 @@ impl DictateState {
         if safe.is_empty() {
             return Ok(Committed::Empty);
         }
-
-        // enigo drives SendInput and arboard talks to the OS clipboard — both
-        // block; never run them on an async worker.
-        let to_inject = safe.clone();
-        tokio::task::spawn_blocking(move || inject_text(&to_inject))
-            .await
-            .map_err(|e| format!("injection task failed: {e}"))?
-            .map_err(|e| e.to_string())?;
         Ok(Committed::Typed(safe))
+    }
+
+    /// Block until the transcript has settled — see [`Timings`].
+    async fn await_transcript(&self, t: Timings) {
+        let start = Instant::now();
+        loop {
+            {
+                let inc = self.incoming.lock().await;
+                if inc.done.is_some() {
+                    info!("commit: turn.done received");
+                    return;
+                }
+                let elapsed = start.elapsed();
+                if elapsed >= t.deadline {
+                    warn!(?elapsed, "commit: transcript deadline hit");
+                    return;
+                }
+                if !inc.seen && elapsed >= t.no_event {
+                    info!("commit: no transcript events at all");
+                    return;
+                }
+                if let Some(last) = inc.last {
+                    if !inc.text.trim().is_empty() && last.elapsed() >= t.quiet {
+                        info!("commit: transcript went quiet");
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(t.poll).await;
+        }
     }
 
     /// Tear down without typing anything.
@@ -111,7 +220,7 @@ impl DictateState {
     pub async fn abort(&self) {
         *self.listening.lock().await = false;
         self.abort_accumulator().await;
-        self.buffer.lock().await.clear();
+        *self.incoming.lock().await = Incoming::default();
     }
 
     async fn abort_accumulator(&self) {
@@ -120,8 +229,15 @@ impl DictateState {
         }
     }
 
+    /// Live preview text for the pill.
     pub async fn current_buffer(&self) -> String {
-        self.buffer.lock().await.clone()
+        let inc = self.incoming.lock().await;
+        inc.done.clone().unwrap_or_else(|| inc.text.clone())
+    }
+
+    #[cfg(test)]
+    async fn set_text(&self, text: &str) {
+        self.incoming.lock().await.text = text.to_string();
     }
 }
 
@@ -131,7 +247,7 @@ impl Default for DictateState {
     }
 }
 
-async fn accumulate_loop(mut rx: tokio::sync::broadcast::Receiver<Notification>, buf: SharedBuf) {
+async fn accumulate_loop(mut rx: broadcast::Receiver<Notification>, incoming: Shared) {
     use tokio::sync::broadcast::error::RecvError;
     loop {
         match rx.recv().await {
@@ -139,7 +255,18 @@ async fn accumulate_loop(mut rx: tokio::sync::broadcast::Receiver<Notification>,
                 if let Some(delta) = n.params.get("delta").and_then(|d| d.as_str()) {
                     // Deliberately not logging the delta itself: it is the
                     // user's speech and may contain secrets.
-                    buf.lock().await.push_str(delta);
+                    let mut inc = incoming.lock().await;
+                    inc.text.push_str(delta);
+                    inc.mark();
+                }
+            }
+            // The authoritative end-of-turn transcript. Used in preference to
+            // the accumulated deltas, which can arrive partial or repeated.
+            Ok(n) if is_user_transcript_done(&n.method) => {
+                if let Some(text) = n.params.get("text").and_then(|t| t.as_str()) {
+                    let mut inc = incoming.lock().await;
+                    inc.done = Some(text.to_string());
+                    inc.mark();
                 }
             }
             Ok(_) => {}
@@ -194,6 +321,12 @@ pub fn is_user_transcript_delta(method: &str, params: &Value) -> bool {
         && params.get("role").and_then(|r| r.as_str()) == Some("user")
 }
 
+/// `turn.done` is only mapped for the user role upstream, so the method alone
+/// is enough — assistant turns never reach this notification.
+pub fn is_user_transcript_done(method: &str) -> bool {
+    method == "thread/realtime/transcript/done"
+}
+
 pub fn type_text_safe(text: &str) -> Result<(), RpcError> {
     if text.is_empty() {
         return Ok(());
@@ -218,6 +351,14 @@ pub fn type_text_safe(text: &str) -> Result<(), RpcError> {
 /// Ctrl+V — instant, and it can optionally restore the previous clipboard so
 /// the user's own clipboard is never clobbered (the VoiceInk behavior).
 fn inject_text(text: &str) -> Result<(), RpcError> {
+    // `global-hotkey` reports "released" as soon as the hotkey's *main* key
+    // comes up, so with a chord like Ctrl+E the commit starts while Ctrl is
+    // still held. Typing then lands as Ctrl+letter shortcuts and a paste
+    // becomes Ctrl+Shift+V. Wait the modifiers out; if the user really is
+    // leaning on one, inject anyway rather than lose the transcript.
+    if !crate::winkeys::wait_for_modifiers_release(MODIFIER_GRACE) {
+        warn!("modifiers still held after grace period; injecting anyway");
+    }
     let cfg = config::get();
     let text = if cfg.append_trailing_space {
         format!("{text} ")
@@ -305,17 +446,204 @@ mod tests {
         ));
     }
 
+    /// Short timings so the wait-for-transcript tests stay fast.
+    fn fast() -> Timings {
+        Timings {
+            deadline: Duration::from_millis(600),
+            quiet: Duration::from_millis(120),
+            no_event: Duration::from_millis(200),
+            poll: Duration::from_millis(10),
+        }
+    }
+
+    fn delta(text: &str) -> Notification {
+        Notification {
+            method: "thread/realtime/transcript/delta".into(),
+            params: json!({ "role": "user", "delta": text }),
+        }
+    }
+
+    fn done(text: &str) -> Notification {
+        Notification {
+            method: "thread/realtime/transcript/done".into(),
+            params: json!({ "text": text }),
+        }
+    }
+
     #[tokio::test]
     async fn empty_and_whitespace_transcripts_commit_as_empty() {
         for input in ["", "   ", "\n\t "] {
             let state = DictateState::new();
-            *state.buffer.lock().await = input.into();
+            state.set_text(input).await;
             assert_eq!(
                 state.stop_listening().await.unwrap(),
                 Committed::Empty,
                 "input {input:?}"
             );
         }
+    }
+
+    /// The core timing fix: the transcript keeps arriving after the microphone
+    /// stops. Committing on key-up alone dropped the tail of every utterance.
+    #[tokio::test]
+    async fn commit_waits_for_deltas_that_arrive_after_the_key_is_released() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(delta("배포")).unwrap();
+
+        // The rest of the sentence lands after the user has already let go —
+        // within the quiet window, so the commit has to still be waiting.
+        let late = tx.clone();
+        let lag = Duration::from_millis(60);
+        tokio::spawn(async move {
+            tokio::time::sleep(lag).await;
+            let _ = late.send(delta(" 해줘"));
+        });
+
+        let start = Instant::now();
+        let out = state.finish(fast()).await.unwrap();
+        assert_eq!(out, Committed::Typed("배포 해줘".into()));
+        assert!(
+            start.elapsed() >= lag,
+            "committed before the tail could arrive"
+        );
+    }
+
+    /// `turn.done` carries the authoritative transcript and wins over whatever
+    /// the deltas happened to accumulate.
+    #[tokio::test]
+    async fn turn_done_overrides_accumulated_deltas_and_ends_the_wait() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(delta("안녕")).unwrap();
+        tx.send(done("안녕하세요")).unwrap();
+
+        let start = Instant::now();
+        let out = state.finish(fast()).await.unwrap();
+        assert_eq!(out, Committed::Typed("안녕하세요".into()));
+        assert!(
+            start.elapsed() < Duration::from_millis(120),
+            "turn.done must end the wait immediately, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A dead session must not stall the commit for the full deadline.
+    #[tokio::test]
+    async fn silent_session_gives_up_at_the_no_event_grace() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+
+        let t = fast();
+        let start = Instant::now();
+        assert_eq!(state.finish(t).await.unwrap(), Committed::Empty);
+        let elapsed = start.elapsed();
+        assert!(elapsed >= t.no_event, "returned too early: {elapsed:?}");
+        assert!(elapsed < t.deadline, "waited the full deadline: {elapsed:?}");
+    }
+
+    /// A server that streams forever must not hold the commit open forever.
+    #[tokio::test]
+    async fn endless_deltas_are_cut_off_at_the_deadline() {
+        let (tx, _) = broadcast::channel(64);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        let chatty = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if chatty.send(delta("x")).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let t = fast();
+        let start = Instant::now();
+        let out = state.finish(t).await.unwrap();
+        assert!(matches!(out, Committed::Typed(_)), "got {out:?}");
+        assert!(
+            start.elapsed() < t.deadline + Duration::from_millis(300),
+            "overran the deadline: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Once the transcript stops moving there is no reason to sit out the rest
+    /// of the deadline.
+    #[tokio::test]
+    async fn quiet_transcript_commits_without_waiting_for_the_deadline() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(delta("hello")).unwrap();
+
+        let t = fast();
+        let start = Instant::now();
+        assert_eq!(state.finish(t).await.unwrap(), Committed::Typed("hello".into()));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= t.quiet, "committed before the quiet window: {elapsed:?}");
+        assert!(elapsed < t.deadline, "waited for the deadline: {elapsed:?}");
+    }
+
+    /// Assistant chatter and non-transcript traffic must never extend the wait
+    /// or reach the buffer.
+    #[tokio::test]
+    async fn unrelated_events_do_not_feed_the_transcript() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(Notification {
+            method: "thread/realtime/transcript/delta".into(),
+            params: json!({ "role": "assistant", "delta": "나는 어시스턴트" }),
+        })
+        .unwrap();
+        tx.send(Notification {
+            method: "thread/realtime/started".into(),
+            params: json!({}),
+        })
+        .unwrap();
+
+        assert_eq!(state.finish(fast()).await.unwrap(), Committed::Empty);
+    }
+
+    /// A recording that is aborted mid-flight must leave nothing behind for the
+    /// next one to inject.
+    #[tokio::test]
+    async fn abort_discards_the_transcript() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(delta("secret")).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(state.current_buffer().await, "secret");
+
+        state.abort().await;
+        assert!(!state.is_listening().await);
+        assert_eq!(state.current_buffer().await, "");
+        assert_eq!(state.finish(fast()).await.unwrap(), Committed::Empty);
+    }
+
+    /// Restarting must not resurrect the previous dictation's text, and the old
+    /// accumulator must be gone — two live accumulators duplicated every delta.
+    #[tokio::test]
+    async fn restart_clears_previous_transcript_and_retires_the_accumulator() {
+        let (first, _) = broadcast::channel(16);
+        let (second, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(first.subscribe()).await.unwrap();
+        first.send(delta("old")).unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        state.start_listening(second.subscribe()).await.unwrap();
+        assert_eq!(state.current_buffer().await, "");
+        // Traffic on the retired channel must not reach the new dictation.
+        first.send(delta("stale")).unwrap();
+        second.send(delta("new")).unwrap();
+        assert_eq!(state.finish(fast()).await.unwrap(), Committed::Typed("new".into()));
     }
 
     #[test]
@@ -396,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn hallucinated_buffer_reports_filtered_not_silently_dropped() {
         let state = DictateState::new();
-        *state.buffer.lock().await = "thank you for watching".into();
+        state.set_text("thank you for watching").await;
         assert_eq!(
             state.stop_listening().await.unwrap(),
             Committed::Filtered("thank you for watching".into())

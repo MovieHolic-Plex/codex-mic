@@ -32,6 +32,11 @@ audiopus_sys = { version = "0.2.2", features = ["static"] }
 rustls = { version = "0.23.42", features = ["ring"] }
 arboard = "3.6.1"
 
+[target.'cfg(windows)'.dependencies]
+# Keyboard toggle/hold state: caps restoration by comparison, and holding the
+# transcript back until Ctrl/Shift/Alt/Win are physically up.
+windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "test-util"] }
 

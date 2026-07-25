@@ -363,20 +363,48 @@ impl RealtimeSession {
         }
         while pending.len() >= OPUS_FRAME_SAMPLES {
             let frame: Vec<i16> = pending.drain(..OPUS_FRAME_SAMPLES).collect();
-            let encoded = self.encoder.lock().await.encode(&frame)?;
-            self.track
-                .write_sample(&Sample {
-                    data: Bytes::from(encoded),
-                    timestamp: SystemTime::now(),
-                    duration: Duration::from_millis(20),
-                    packet_timestamp: 0,
-                    prev_dropped_packets: 0,
-                    prev_padding_packets: 0,
-                })
-                .await
-                .map_err(|e| RpcError::Disconnected(format!("write sample: {e}")))?;
+            self.write_frame(&frame).await?;
         }
         Ok(())
+    }
+
+    /// End the turn cleanly: zero-pad the partial frame that `append_pcm` had
+    /// to hold back, then send `silence` worth of digital silence.
+    ///
+    /// Without this the RTP stream simply stops mid-word. The server's VAD has
+    /// nothing to close the turn on, the last partial frame (up to 20 ms of
+    /// speech) is never transmitted at all, and `turn.done` may never arrive —
+    /// which is exactly how the final syllable of every dictation went missing.
+    pub async fn flush_tail(&self, silence: Duration) -> Result<(), RpcError> {
+        {
+            let mut pending = self.pending.lock().await;
+            if !pending.is_empty() {
+                pending.resize(OPUS_FRAME_SAMPLES, 0);
+                let frame: Vec<i16> = pending.drain(..OPUS_FRAME_SAMPLES).collect();
+                drop(pending);
+                self.write_frame(&frame).await?;
+            }
+        }
+        let quiet = vec![0i16; OPUS_FRAME_SAMPLES];
+        for _ in 0..(silence.as_millis() / 20) {
+            self.write_frame(&quiet).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_frame(&self, frame: &[i16]) -> Result<(), RpcError> {
+        let encoded = self.encoder.lock().await.encode(frame)?;
+        self.track
+            .write_sample(&Sample {
+                data: Bytes::from(encoded),
+                timestamp: SystemTime::now(),
+                duration: Duration::from_millis(20),
+                packet_timestamp: 0,
+                prev_dropped_packets: 0,
+                prev_padding_packets: 0,
+            })
+            .await
+            .map_err(|e| RpcError::Disconnected(format!("write sample: {e}")))
     }
 
     pub async fn disconnect(&self) {
