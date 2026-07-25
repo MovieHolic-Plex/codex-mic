@@ -131,7 +131,7 @@ cargo run --example micprobe   # 6s capture on every device, prints RMS/peak
 ## How it works / 구조
 
 ```
-hold Ctrl+E → cpal mic capture (→ 48 kHz mono) → AGC gain
+hold hotkey → cpal mic capture (→ 48 kHz mono) → AGC gain
             → Opus encode (static libopus) → WebRTC realtime session
             → live transcript events → sanitize → enigo keystrokes (or Ctrl+V)
 ```
