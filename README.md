@@ -1,7 +1,7 @@
 # Codex Mic / 코덱스 마이크
 
-**Hold Ctrl+E, speak, release — your words are typed wherever the keyboard focus is.**
-**Ctrl+E를 누르고 말한 뒤 손을 떼면, 키보드 포커스가 있는 곳에 그대로 타이핑됩니다.**
+**Hold CapsLock, speak, release — your words are typed wherever the keyboard focus is.**
+**CapsLock을 누르고 말한 뒤 손을 떼면, 키보드 포커스가 있는 곳에 그대로 타이핑됩니다.**
 
 A native Windows voice dictation tool (Tauri + Rust). Signs in with your
 **Codex CLI login** — no API key needed.
@@ -39,17 +39,25 @@ A native Windows voice dictation tool (Tauri + Rust). Signs in with your
 
 ```
 1. Click where you want text (terminal, editor, chat — anywhere)
-2. Hold Ctrl+E and speak
+2. Hold CapsLock and speak — the pill reacts instantly
 3. Release — the transcript is typed at the cursor
 
 1. 타이핑할 곳 클릭 (터미널, 에디터 어디든)
-2. Ctrl+E를 누른 채로 말하기
+2. CapsLock을 누른 채로 말하기 — pill이 즉시 반응
 3. 손 떼기 → 커서 위치에 타이핑
 ```
 
+Why CapsLock: it's a single key (one finger), it collides with nothing a
+developer actually uses, and the app swallows the press before it can toggle
+caps state. Prefer something else — F9, backquote, Ctrl+E, any key or chord —
+it's one field in settings.
+왜 CapsLock인가: 단일 키라 한 손가락으로 되고, 개발자가 실제로 쓰는 키와
+충돌하지 않으며, 캡스 상태는 앱이 원복합니다. F9, 백틱, Ctrl+E 등 원하는
+키로 설정에서 바꿀 수 있습니다.
+
 | pill | meaning |
 |------|---------|
-| `Ctrl+E` (dim) | idle / 대기 |
+| `CapsLock` (dim) | idle / 대기 |
 | `듣는 중…` + red dot + green meter | recording / 녹음 중 |
 | `변환 중…` | finishing / 마무리 중 |
 | `✓ text…` | typed / 타이핑 완료 |
@@ -64,7 +72,7 @@ hotkey changes apply instantly. **Ctrl+Shift+E**로 엽니다.
 
 | Setting | Options | Default |
 |---------|---------|---------|
-| Dictation hotkey / 받아쓰기 핫키 | any shortcut | `Ctrl+E` |
+| Dictation hotkey / 받아쓰기 핫키 | any key or chord | `CapsLock` |
 | Settings hotkey / 설정 핫키 | any shortcut | `Ctrl+Shift+E` |
 | Activation / 작동 방식 | push-to-talk, toggle | push-to-talk |
 | Silence auto-stop / 무음 자동 종료 | off, 1.5s, 2.5s, 4s | off |

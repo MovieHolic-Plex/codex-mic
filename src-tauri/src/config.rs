@@ -64,7 +64,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hotkey: "Ctrl+E".to_string(),
+            // Single-key hold by default: CapsLock needs one finger, collides
+            // with nothing a developer actually uses, and (once registered) is
+            // swallowed before it can toggle caps state. Any other key or
+            // chord can be set in the settings panel.
+            hotkey: "CapsLock".to_string(),
             settings_hotkey: "Ctrl+Shift+E".to_string(),
             // Push-to-talk matches the universal "hold to record" intuition;
             // toggle mode remains available in settings.
@@ -158,7 +162,7 @@ mod tests {
     #[test]
     fn empty_json_uses_defaults() {
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.hotkey, "Ctrl+E");
+        assert_eq!(cfg.hotkey, "CapsLock");
         assert_eq!(cfg.activation_mode, ActivationMode::PushToTalk);
         assert_eq!(cfg.silence_autostop_ms, 0);
         assert_eq!(cfg.injection_mode, InjectionMode::Type);

@@ -180,6 +180,33 @@ async fn toggle(app: tauri::AppHandle, window: WebviewWindow) {
     }
 }
 
+/// After a CapsLock-initiated dictation, send exactly one compensating click.
+/// Holding the hotkey toggles caps state exactly once (RegisterHotKey swallows
+/// the keystroke but not the toggle), so one click always restores it — no
+/// state reading needed. The injected press re-enters our hotkey handler but
+/// is swallowed by the repeat guard (DICTATION_KEY_DOWN pre-set); the release
+/// finds nothing listening.
+fn restore_caps_state_if_needed() {
+    let cfg = config::get();
+    let is_capslock = cfg
+        .hotkey
+        .trim()
+        .parse::<Shortcut>()
+        .map(|s| format!("{s:?}").contains("CapsLock"))
+        .unwrap_or(false);
+    if !is_capslock {
+        return;
+    }
+    info!("restoring caps lock state");
+    DICTATION_KEY_DOWN.store(true, Ordering::SeqCst);
+    tokio::task::spawn_blocking(|| {
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+        if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+            let _ = enigo.key(Key::CapsLock, Direction::Click);
+        }
+    });
+}
+
 async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
     info!("start_dictation: opening microphone");
     let state = app.state::<AppState>();
@@ -199,6 +226,12 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
         }
     };
     *state.capture.lock().await = Some(capture);
+
+    // Feedback must be instant: the user starts talking the moment the key
+    // goes down, and the mic is already buffering — show it NOW, not after
+    // the (possibly multi-second) session reconnect.
+    let _ = app.emit("dictate://started", serde_json::json!({}));
+    configure_overlay(window);
 
     info!("start_dictation: ensuring session");
     if let Err(e) = ensure_connected(app).await {
@@ -232,9 +265,6 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
     PEAK_RMS.store(0, Ordering::SeqCst);
     spawn_pcm_pump(app.clone(), session, stop_flag.clone());
     PUMP_STOP.lock().unwrap().replace(stop_flag);
-
-    let _ = app.emit("dictate://started", serde_json::json!({}));
-    configure_overlay(window);
 
     // The user may have released the hotkey while we were still preparing
     // (capture + reconnect can take seconds). Honor the release: commit
@@ -375,6 +405,7 @@ async fn abort_dictation(app: &tauri::AppHandle) {
         c.stop();
     }
     state.dictate.abort().await;
+    restore_caps_state_if_needed();
 }
 
 async fn stop_dictation(app: &tauri::AppHandle) {
@@ -421,6 +452,7 @@ async fn stop_dictation(app: &tauri::AppHandle) {
             let _ = app.emit("dictate://error", serde_json::json!({ "message": e }));
         }
     }
+    restore_caps_state_if_needed();
 }
 
 pub fn run() {
