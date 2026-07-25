@@ -1,4 +1,10 @@
 src-tauri/target/
+src-tauri/gen/
 _protocol/
 .omo/
+.senpi/
+node_modules/
 *.exe
+.gjc/
+nul
+targets.json

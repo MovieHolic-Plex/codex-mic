@@ -1,128 +1,209 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// The frontend is purely an indicator + settings panel. Audio is captured by
+// cpal and Opus-encoded in Rust, then streamed over WebRTC — no AudioContext,
+// no RTCPeerConnection here.
+
 const label = document.getElementById("label");
 const pill = document.getElementById("pill");
+const settings = document.getElementById("settings");
+const settingsStatus = document.getElementById("settings-status");
+
 let hideTimer = null;
-let pc = null;
-let ctx = null;
-let dest = null;
-let audioTrack = null;
 let unlisteners = [];
+let config = null;
+let settingsOpen = false;
 
 function setState(state, text) {
   pill.dataset.state = state;
   label.textContent = text;
   if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
-  if (state === "success") {
-    hideTimer = setTimeout(() => { pill.dataset.state = "hidden"; label.textContent = "Ctrl+E"; }, 1500);
-  } else if (state === "error") {
-    hideTimer = setTimeout(() => { pill.dataset.state = "hidden"; label.textContent = "Ctrl+E"; }, 5000);
-  }
-}
-
-function waitForIce(peer) {
-  return new Promise((r) => {
-    if (peer.iceGatheringState === "complete") return r();
-    const check = () => {
-      if (peer.iceGatheringState === "complete") {
-        peer.removeEventListener("icegatheringstatechange", check);
-        r();
-      }
-    };
-    peer.addEventListener("icegatheringstatechange", check);
-    setTimeout(r, 3500);
-  });
-}
-
-function base64ToFloat32(b64) {
-  const bin = atob(b64);
-  const len = bin.length / 2;
-  const f32 = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    const lo = bin.charCodeAt(i * 2);
-    const hi = bin.charCodeAt(i * 2 + 1);
-    const s16 = (hi << 8) | lo;
-    const signed = s16 > 32767 ? s16 - 65536 : s16;
-    f32[i] = signed / 32768.0;
-  }
-  return f32;
-}
-
-async function onStarted() {
-  setState("recording", "듣는 중…");
-  try {
-    ctx = new AudioContext({ sampleRate: 24000 });
-    dest = ctx.createMediaStreamDestination();
-    audioTrack = dest.stream.getAudioTracks()[0];
-
-    pc = new RTCPeerConnection();
-    pc.createDataChannel("oai-events");
-    pc.addTrack(audioTrack, dest.stream);
-
-    const offer = await pc.createOffer({ offerToReceiveAudio: false });
-    await pc.setLocalDescription(offer);
-    await waitForIce(pc);
-
-    await invoke("realtime_start", { sdpOffer: pc.localDescription.sdp });
-  } catch (e) {
-    setState("error", "오류: " + String(e).slice(0, 60));
-  }
-}
-
-function onPcm(data) {
-  if (!ctx || !dest) return;
-  const f32 = base64ToFloat32(data);
-  const buffer = ctx.createBuffer(1, f32.length, 24000);
-  buffer.getChannelData(0).set(f32);
-  const src = ctx.createBufferSource();
-  src.buffer = buffer;
-  src.connect(dest);
-  src.start();
-}
-
-async function onSdp(sdp) {
-  if (!pc) return;
-  try { await pc.setRemoteDescription({ type: "answer", sdp }); }
-  catch (e) { console.error("SDP error:", e); }
-}
-
-function onStopped() {
-  if (pc) { pc.close(); pc = null; }
-  if (audioTrack) { audioTrack.stop(); audioTrack = null; }
-  if (ctx) { ctx.close(); ctx = null; dest = null; }
-  setState("hidden", "Ctrl+E");
+  const idle = () => { pill.dataset.state = "hidden"; label.textContent = config?.hotkey || "Ctrl+E"; };
+  if (state === "success") hideTimer = setTimeout(idle, 1500);
+  else if (state === "error") hideTimer = setTimeout(idle, 5000);
 }
 
 async function setupListeners() {
   for (const u of unlisteners) await u();
   unlisteners = [];
   const subs = [
-    ["dictate://started", () => onStarted()],
+    ["dictate://started", () => setState("recording", "듣는 중…")],
     ["dictate://processing", () => setState("processing", "변환 중…")],
     ["dictate://stopped", (e) => {
       const text = e.payload?.text || "";
-      if (text) { setState("success", `✓ ${text.slice(0, 60)}`); }
-      else { onStopped(); }
+      if (text) setState("success", `✓ ${text.slice(0, 60)}`);
+      else setState("hidden", config?.hotkey || "Ctrl+E");
+    }],
+    ["dictate://filtered", (e) => {
+      const text = e.payload?.text || "";
+      setState("error", `⚠ 필터됨: ${text.slice(0, 40)}`);
     }],
     ["dictate://error", (e) => setState("error", `⚠ ${e.payload?.message || "오류"}`)],
-    ["realtime://sdp", (e) => onSdp(e.payload.sdp)],
     ["realtime://error", (e) => setState("error", `⚠ ${e.payload?.message || "오류"}`)],
     ["realtime://closed", () => {}],
-    ["audio://pcm", (e) => onPcm(e.payload.data)],
+    ["settings://open", () => openSettings()],
+    ["settings://close", () => closeSettings()],
   ];
   for (const [name, h] of subs) unlisteners.push(await listen(name, h));
 }
 
-setupListeners();
-setState("hidden", "Ctrl+E");
+// ---------- settings panel ----------
 
-setInterval(async () => {
-  if (pill.dataset.state === "recording") {
-    try {
-      const b = await invoke("buffer");
-      if (b) label.textContent = b.length > 80 ? b.slice(-80) : b;
-      else label.textContent = "듣는 중…";
-    } catch {}
+const fields = {
+  hotkey: document.getElementById("cfg-hotkey"),
+  settingsHotkey: document.getElementById("cfg-settings-hotkey"),
+  activationMode: document.getElementById("cfg-activation-mode"),
+  silenceAutostop: document.getElementById("cfg-silence-autostop"),
+  injectionMode: document.getElementById("cfg-injection-mode"),
+  restoreClipboard: document.getElementById("cfg-restore-clipboard"),
+  appendSpace: document.getElementById("cfg-append-space"),
+  language: document.getElementById("cfg-language"),
+  micGain: document.getElementById("cfg-mic-gain"),
+  mic: document.getElementById("cfg-mic"),
+  hallucinationFilter: document.getElementById("cfg-hallucination-filter"),
+};
+
+function fillForm(cfg, mics) {
+  fields.hotkey.value = cfg.hotkey;
+  fields.settingsHotkey.value = cfg.settings_hotkey;
+  fields.activationMode.value = cfg.activation_mode;
+  fields.silenceAutostop.value = String(cfg.silence_autostop_ms);
+  fields.injectionMode.value = cfg.injection_mode;
+  fields.restoreClipboard.checked = cfg.restore_clipboard;
+  fields.appendSpace.checked = cfg.append_trailing_space;
+  fields.language.value = cfg.language;
+  fields.micGain.value = String(cfg.mic_gain_db ?? 20);
+  fields.hallucinationFilter.checked = cfg.hallucination_filter;
+
+  fields.mic.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = "시스템 기본값";
+  fields.mic.appendChild(def);
+  for (const name of mics) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    fields.mic.appendChild(opt);
   }
+  fields.mic.value = cfg.mic_device || "";
+
+  syncInjectionRow();
+}
+
+function syncInjectionRow() {
+  document.getElementById("row-restore-clipboard").style.display =
+    fields.injectionMode.value === "clipboard" ? "" : "none";
+}
+fields.injectionMode.addEventListener("change", syncInjectionRow);
+
+function readForm() {
+  return {
+    hotkey: fields.hotkey.value.trim() || "Ctrl+E",
+    settings_hotkey: fields.settingsHotkey.value.trim() || "Ctrl+Shift+E",
+    activation_mode: fields.activationMode.value,
+    silence_autostop_ms: parseInt(fields.silenceAutostop.value, 10) || 0,
+    silence_threshold: config?.silence_threshold ?? 500,
+    injection_mode: fields.injectionMode.value,
+    restore_clipboard: fields.restoreClipboard.checked,
+    append_trailing_space: fields.appendSpace.checked,
+    language: fields.language.value,
+    mic_gain_db: parseFloat(fields.micGain.value) || 0,
+    mic_device: fields.mic.value || null,
+    hallucination_filter: fields.hallucinationFilter.checked,
+  };
+}
+
+async function openSettings() {
+  settingsOpen = true;
+  settings.hidden = false;
+  settingsStatus.textContent = "";
+  try {
+    const [cfg, mics] = await Promise.all([invoke("get_config"), invoke("list_mics")]);
+    config = cfg;
+    fillForm(cfg, mics);
+  } catch (e) {
+    settingsStatus.textContent = `설정 로드 실패: ${e}`;
+  }
+}
+
+function closeSettings() {
+  settingsOpen = false;
+  settings.hidden = true;
+}
+
+document.getElementById("close-settings").addEventListener("click", async () => {
+  try { await invoke("close_settings"); } catch {}
+  closeSettings();
+});
+
+document.getElementById("gear").addEventListener("click", async (e) => {
+  e.stopPropagation();
+  try { await invoke("toggle_settings"); } catch {}
+});
+
+document.getElementById("quit").addEventListener("click", async (e) => {
+  e.stopPropagation();
+  try { await invoke("quit_app"); } catch {}
+});
+
+// Drag the pill anywhere: mousedown on the pill background (not the buttons)
+// kicks off an OS window drag. Position persists across launches via config.
+pill.addEventListener("mousedown", async (e) => {
+  if (e.button !== 0) return;
+  if (e.target.closest(".pill-btn")) return;
+  try { await invoke("start_drag"); } catch {}
+});
+
+// Injection test: 2s grace so the user can watch it land in the target app.
+// (The pill window never takes focus in pill mode, so the text goes to
+// whatever app was focused before the click.)
+document.getElementById("test-inject").addEventListener("click", async () => {
+  settingsStatus.textContent = "2초 후 주입…";
+  setTimeout(async () => {
+    try {
+      const typed = await invoke("test_inject", { text: "codex-mic 주입 테스트 OK" });
+      settingsStatus.textContent = `주입됨: ${typed}`;
+    } catch (e) {
+      settingsStatus.textContent = `주입 실패: ${e}`;
+    }
+  }, 2000);
+});
+
+document.getElementById("save-settings").addEventListener("click", async () => {
+  const next = readForm();
+  try {
+    await invoke("set_config", { config: next });
+    config = next;
+    settingsStatus.textContent = "저장됨 ✓";
+    setTimeout(() => { settingsStatus.textContent = ""; }, 2000);
+  } catch (e) {
+    settingsStatus.textContent = `저장 실패: ${e}`;
+  }
+});
+
+// ---------- init ----------
+
+async function init() {
+  await setupListeners();
+  try { config = await invoke("get_config"); } catch {}
+  setState("hidden", config?.hotkey || "Ctrl+E");
+  try {
+    if (!(await invoke("has_oauth"))) {
+      setState("error", "⚠ codex login 필요");
+    }
+  } catch {}
+}
+
+init();
+
+// Live transcript preview while recording.
+setInterval(async () => {
+  if (settingsOpen) return;
+  if (pill.dataset.state !== "recording") return;
+  try {
+    const b = await invoke("buffer");
+    label.textContent = b ? (b.length > 80 ? b.slice(-80) : b) : "듣는 중…";
+  } catch {}
 }, 200);

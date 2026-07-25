@@ -1,13 +1,13 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
 body {
-  display: flex; align-items: center; justify-content: center;
+  display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start;
   font: 13px/1 "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 .pill {
   display: flex; align-items: center; gap: 9px;
-  width: 100%; height: 100%;
+  width: 100%; height: 56px; flex: 0 0 auto;
   padding: 0 16px;
   border-radius: 28px;
   background: rgba(18, 22, 28, 0.92);
@@ -56,4 +56,105 @@ body {
   flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   letter-spacing: .2px;
+  cursor: move;
+}
+
+.pill-btn {
+  flex: 0 0 auto;
+  background: none; border: none;
+  color: #8a93a2; font-size: 13px;
+  cursor: pointer; padding: 3px 5px;
+  border-radius: 6px;
+}
+.pill-btn:hover { color: #e6e9ee; background: rgba(255,255,255,0.08); }
+
+.foot-btns { display: flex; gap: 8px; }
+
+.ghost-btn {
+  background: rgba(255,255,255,0.06); color: #aab2bf;
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 8px;
+  padding: 7px 12px; font: inherit; cursor: pointer;
+}
+.ghost-btn:hover { color: #e6e9ee; }
+
+/* ---------- settings panel ---------- */
+
+.settings {
+  flex: 1 1 auto;
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 8px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(18, 22, 28, 0.96);
+  border: 1px solid rgba(255,255,255,0.1);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  color: #e6e9ee;
+  overflow-y: auto;
+  line-height: 1.35;
+}
+
+.settings-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-weight: 600; font-size: 14px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.icon-btn {
+  background: none; border: none; color: #8a93a2;
+  font-size: 14px; cursor: pointer; padding: 2px 6px;
+}
+.icon-btn:hover { color: #e6e9ee; }
+
+.row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.row > span { color: #aab2bf; flex: 0 0 auto; }
+.row input[type="text"], .row select {
+  flex: 1 1 auto; min-width: 0;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px;
+  color: #e6e9ee;
+  padding: 6px 8px;
+  font: inherit;
+}
+.row input[type="text"]:focus, .row select:focus {
+  outline: none; border-color: rgba(126, 240, 192, 0.5);
+}
+.row select option { background: #12161c; }
+
+.row.check { justify-content: flex-start; gap: 8px; cursor: pointer; }
+.row.check input { accent-color: #7ef0c0; }
+
+.settings-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+}
+
+.status { color: #8a93a2; font-size: 12px; }
+
+.save-btn {
+  background: #7ef0c0; color: #10231b;
+  border: none; border-radius: 8px;
+  padding: 7px 18px;
+  font: inherit; font-weight: 600;
+  cursor: pointer;
+}
+.save-btn:hover { background: #96f5cd; }
+
+.meter {
+  flex: 0 0 48px; height: 6px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.08);
+  overflow: hidden;
+  display: none;
+}
+.pill[data-state="recording"] .meter { display: block; }
+.meter-fill {
+  display: block; height: 100%; width: 0%;
+  background: #7ef0c0;
+  transition: width .1s linear;
 }

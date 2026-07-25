@@ -9,8 +9,92 @@
   <body>
     <div id="pill" class="pill" data-state="hidden">
       <span class="dot" id="dot"></span>
-      <span class="label" id="label">Ctrl+E</span>
+      <span class="label drag-zone" id="label" title="드래그해서 이동">Ctrl+E</span>
+      <span class="meter" id="meter"><span class="meter-fill" id="meter-fill"></span></span>
+      <button class="pill-btn" id="gear" title="설정">⚙</button>
+      <button class="pill-btn" id="quit" title="종료">✕</button>
     </div>
+
+    <div id="settings" class="settings" hidden>
+      <div class="settings-head">
+        <span>설정</span>
+        <button id="close-settings" class="icon-btn" title="닫기">✕</button>
+      </div>
+
+      <label class="row">
+        <span>받아쓰기 핫키</span>
+        <input id="cfg-hotkey" type="text" spellcheck="false" />
+      </label>
+      <label class="row">
+        <span>설정 핫키</span>
+        <input id="cfg-settings-hotkey" type="text" spellcheck="false" />
+      </label>
+      <label class="row">
+        <span>작동 방식</span>
+        <select id="cfg-activation-mode">
+          <option value="toggle">토글 (눌러서 시작/종료)</option>
+          <option value="push_to_talk">누르는 동안만 녹음</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>무음 자동 종료</span>
+        <select id="cfg-silence-autostop">
+          <option value="0">끔</option>
+          <option value="1500">1.5초</option>
+          <option value="2500">2.5초</option>
+          <option value="4000">4초</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>텍스트 입력 방식</span>
+        <select id="cfg-injection-mode">
+          <option value="type">키보드 타이핑</option>
+          <option value="clipboard">클립보드 붙여넣기</option>
+        </select>
+      </label>
+      <label class="row check" id="row-restore-clipboard">
+        <input id="cfg-restore-clipboard" type="checkbox" />
+        <span>붙여넣기 후 클립보드 복원</span>
+      </label>
+      <label class="row check">
+        <input id="cfg-append-space" type="checkbox" />
+        <span>텍스트 뒤에 공백 추가</span>
+      </label>
+      <label class="row">
+        <span>언어</span>
+        <select id="cfg-language">
+          <option value="auto">자동 감지</option>
+          <option value="korean">한국어</option>
+          <option value="english">English</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>마이크 게인 (dB)</span>
+        <select id="cfg-mic-gain">
+          <option value="0">0 (원음)</option>
+          <option value="10">+10</option>
+          <option value="20">+20 (권장)</option>
+          <option value="30">+30</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>마이크</span>
+        <select id="cfg-mic"></select>
+      </label>
+      <label class="row check">
+        <input id="cfg-hallucination-filter" type="checkbox" />
+        <span>환각 전사 필터</span>
+      </label>
+
+      <div class="settings-foot">
+        <span id="settings-status" class="status"></span>
+        <div class="foot-btns">
+          <button id="test-inject" class="ghost-btn">주입 테스트</button>
+          <button id="save-settings" class="save-btn">저장</button>
+        </div>
+      </div>
+    </div>
+
     <script src="app.js" type="module"></script>
   </body>
 </html>
