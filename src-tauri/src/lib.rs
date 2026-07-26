@@ -9,9 +9,10 @@ mod realtime;
 mod winkeys;
 
 use commands::AppState;
+use config::ActivationMode;
 use dictate::Committed;
 use keystate::Action;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, WebviewWindow};
@@ -19,9 +20,17 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tracing::{error, info, warn};
 
 const PCM_PUMP_INTERVAL: Duration = Duration::from_millis(50);
-/// Digital silence appended after the last captured sample so the server-side
-/// VAD sees the end of the utterance instead of a stream that simply stops.
-const SILENCE_TAIL: Duration = Duration::from_millis(400);
+/// Digital silence wrapped around the captured audio.
+///
+/// A recording that begins and ends the instant speech does gives the
+/// transcriber no run-up: its own windowing eats the first and last syllable.
+/// Two seconds on each side is generous — it costs no wall-clock time, since
+/// the padding is bytes appended to a buffer rather than time spent waiting.
+const SILENCE_LEAD: Duration = Duration::from_secs(2);
+const SILENCE_TAIL: Duration = Duration::from_secs(2);
+/// How long the session model gets to write down the utterance. Measured at
+/// 0.5-1.0 s on real speech; past this the side-channel transcript is used.
+const MODEL_TRANSCRIBE_BUDGET: Duration = Duration::from_secs(6);
 /// Pill geometry. The window is sized to the pill exactly — a transparent
 /// window is still hit-testable, so any slack around the pill would swallow
 /// clicks meant for the app underneath.
@@ -213,6 +222,73 @@ fn restore_caps_state(app: &tauri::AppHandle) {
     });
 }
 
+/// How often we ask Windows whether the push-to-talk key is still held.
+const KEY_POLL: Duration = Duration::from_millis(15);
+/// If the key is never *observed* down within this window, key polling is not
+/// telling us anything useful on this machine. The watcher stands down and the
+/// hotkey library's own `Released` event drives the stop, as before.
+const KEY_DOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// Generation counter for the push-to-talk release watcher.
+///
+/// One watcher exists per recording. Bumping this retires whichever watcher is
+/// running, so a thread left over from the previous dictation can never commit
+/// the next one.
+static WATCH_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn cancel_release_watcher() {
+    WATCH_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Drive push-to-talk from the physical key state instead of trusting the
+/// hotkey library's release event.
+///
+/// `global-hotkey` detects release by spawning a thread inside the `WM_HOTKEY`
+/// window procedure that calls `GetAsyncKeyState` **immediately, with no
+/// initial delay**, and declares the key released if that single first read
+/// comes back zero. When it does — and it does — the release lands while the
+/// user is still holding the key, `stop_pending` is set before the recording
+/// is even live, and `started()` commits an empty dictation on the spot. That
+/// is the "start_dictation: hotkey already released; committing" /
+/// "committed: EMPTY peak_rms=0" pair in the logs: not a transcription
+/// problem, a phantom key-up.
+///
+/// This watcher only reports a release it has actually watched happen: the key
+/// must be seen down first, then seen up. Anything it cannot confirm it leaves
+/// alone.
+fn spawn_release_watcher(app: tauri::AppHandle, vk: u16) {
+    let generation = WATCH_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + KEY_DOWN_GRACE;
+        let mut seen_down = false;
+        loop {
+            // A newer press (or a commit) retired us.
+            if WATCH_GEN.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            match winkeys::key_is_down(vk) {
+                Some(true) => seen_down = true,
+                Some(false) if seen_down => break,
+                Some(false) => {
+                    if Instant::now() >= deadline {
+                        warn!(vk, "release watcher: key never read as down; standing down");
+                        return;
+                    }
+                }
+                // Not Windows: no key state to poll.
+                None => return,
+            }
+            std::thread::sleep(KEY_POLL);
+        }
+        info!("hotkey physically released");
+        if keystate::with(|m| m.stop_requested()) == Action::Stop {
+            tauri::async_runtime::spawn(async move { stop_dictation(&app).await });
+        }
+        // Otherwise the recording is still coming up; the stop is queued and
+        // `started()` will honor it.
+    });
+}
+
 async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
     info!("start_dictation: opening microphone");
     let state = app.state::<AppState>();
@@ -257,6 +333,11 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
         return fail_start(app, e);
     }
 
+    // Lead-in silence, before any captured audio reaches the buffer.
+    if let Err(e) = session.append_silence(SILENCE_LEAD).await {
+        warn!(error = %e, "lead-in silence failed");
+    }
+
     let stop_flag = Arc::new(AtomicBool::new(false));
     PEAK_RMS.store(0, Ordering::SeqCst);
     let join = spawn_pcm_pump(app.clone(), session, stop_flag.clone());
@@ -268,7 +349,7 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
     // reconnect can take seconds). The machine remembered that release; honor
     // it now instead of leaving a zombie recording running.
     if keystate::with(|m| m.started()) == Action::Stop {
-        info!("start_dictation: hotkey already released; committing");
+        info!("start_dictation: a stop was queued during startup; committing");
         stop_dictation(app).await;
     }
 }
@@ -278,6 +359,7 @@ async fn start_dictation(app: &tauri::AppHandle, window: &WebviewWindow) {
 /// The press that got us here may already have flipped caps, so that is undone
 /// too — a failed start used to leave CapsLock stuck on.
 fn fail_start(app: &tauri::AppHandle, message: String) {
+    cancel_release_watcher();
     keystate::with(|m| m.start_failed());
     restore_caps_state(app);
     let _ = app.emit("dictate://error", serde_json::json!({ "message": message }));
@@ -431,9 +513,16 @@ fn spawn_realtime_failure_watchdog(app: tauri::AppHandle, session: &Arc<crate::r
         loop {
             match rx.recv().await {
                 Ok(n) if n.method == "thread/realtime/error" => {
-                    if keystate::with(|m| m.stop_requested()) == Action::Stop {
+                    let (phase, action) =
+                        keystate::with(|m| (m.phase(), m.stop_requested()));
+                    if action == Action::Stop {
                         warn!("realtime session failed; releasing microphone");
                         abort_dictation(&app).await;
+                    } else if phase == keystate::Phase::Starting {
+                        // The stop is queued and `started()` will act on it.
+                        // Logged because this path used to be silent and looked
+                        // exactly like a phantom key-up in the logs.
+                        warn!("realtime session failed during startup; stop queued");
                     }
                 }
                 Ok(_) => {}
@@ -447,6 +536,7 @@ fn spawn_realtime_failure_watchdog(app: tauri::AppHandle, session: &Arc<crate::r
 /// Stop recording and discard the buffer without typing or emitting a
 /// `stopped` event — the error already on screen must stay visible.
 async fn abort_dictation(app: &tauri::AppHandle) {
+    cancel_release_watcher();
     restore_caps_state(app);
     halt_pump().await;
     release_capture(app).await;
@@ -455,6 +545,7 @@ async fn abort_dictation(app: &tauri::AppHandle) {
 }
 
 async fn stop_dictation(app: &tauri::AppHandle) {
+    cancel_release_watcher();
     let state = app.state::<AppState>();
     let _ = app.emit("dictate://processing", serde_json::json!({}));
     // First thing, while the key has only just come up: anything later races
@@ -487,9 +578,34 @@ async fn stop_dictation(app: &tauri::AppHandle) {
         if let Err(e) = s.flush_tail(SILENCE_TAIL).await {
             warn!(error = %e, "tail flush failed");
         }
+        // With VAD off our commit is the only thing that opens a turn, and
+        // exactly one transcript always follows it. Under VAD the server's own
+        // `speech_started` already reports this, and claiming a turn that has
+        // already been transcribed would just stall the commit.
+        if crate::realtime::manual_turns() {
+            state.dictate.expect_turn().await;
+        }
     }
 
-    match state.dictate.stop_listening().await {
+    // The session model's own reading of the audio. It follows instructions,
+    // which the transcription side channel's `prompt` does not, so it is the
+    // only thing that reliably keeps a developer's English terms in English.
+    // The side channel still runs underneath as the fallback.
+    let spoken = match (&session, crate::realtime::model_transcription()) {
+        (Some(s), true) => {
+            match crate::realtime::transcribe_committed_audio(s, MODEL_TRANSCRIBE_BUDGET).await {
+                Ok(t) if !t.trim().is_empty() => Some(t),
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(error = %e, "model transcription failed; using the side channel");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    match state.dictate.stop_listening_with(spoken).await {
         Ok(Committed::Typed(text)) => {
             info!(len = text.len(), "dictation committed: typed");
             let _ = app.emit("dictate://stopped", serde_json::json!({ "text": text }));
@@ -555,15 +671,52 @@ pub fn run() {
                 return;
             }
 
+            // The virtual key `RegisterHotKey` is watching, so we can ask
+            // Windows about it ourselves.
+            let vk = keystate::code_to_vk(&dictation.key);
+
+            // Every hotkey event, with the physical key state at that instant.
+            // The race this guards against is invisible without the pair: the
+            // library's "released" against what the keyboard actually says.
+            let physical = vk.and_then(winkeys::key_is_down);
+
             // One decision, made synchronously. Doing this inside the spawned
             // task instead let a press and its release be reordered, and let
             // two presses both decide to start.
             let action = match event.state {
-                ShortcutState::Pressed => keystate::with(|m| m.press(cfg.activation_mode)),
-                _ => keystate::with(|m| m.release()),
+                ShortcutState::Pressed => {
+                    let action = keystate::with(|m| m.press(cfg.activation_mode));
+                    info!(?physical, ?action, "hotkey PRESSED");
+                    action
+                }
+                _ => {
+                    // `global-hotkey` can report a release while the key is
+                    // demonstrably still down (see `spawn_release_watcher`).
+                    // Refuse only a release we can positively disprove: if key
+                    // state is unreadable we honor the event as before, so this
+                    // check can drop a phantom stop but never swallow a real
+                    // one.
+                    if physical == Some(true) {
+                        warn!("hotkey RELEASED (bogus) — the key is still physically down; ignored");
+                        return;
+                    }
+                    let action = keystate::with(|m| m.release());
+                    info!(?physical, ?action, "hotkey RELEASED");
+                    action
+                }
             };
             if action == Action::Ignore {
                 return;
+            }
+
+            // Push-to-talk stops on the physical key-up, watched by us. Armed
+            // here rather than inside `start_dictation` so the key is still
+            // down when the watcher takes its first reading — a fast tap must
+            // be seen as down-then-up, not as never-down.
+            if action == Action::Start && cfg.activation_mode == ActivationMode::PushToTalk {
+                if let Some(vk) = vk {
+                    spawn_release_watcher(app.clone(), vk);
+                }
             }
 
             let app = app.clone();
@@ -636,6 +789,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod integration {
+    use super::{MODEL_TRANSCRIBE_BUDGET, SILENCE_LEAD, SILENCE_TAIL};
+    use crate::dictate::Committed;
     use crate::realtime::{Emitter, RealtimeSession};
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
@@ -725,6 +880,9 @@ mod integration {
         // Wait for transcript events (VAD needs a beat after the last frame).
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut transcript = String::new();
+        let mut turns: Vec<String> = vec![];
+        let mut seen_turns = 0usize;
+        let mut last_turn = Instant::now();
         while Instant::now() < deadline {
             for (name, params) in events.lock().unwrap().iter() {
                 if name == "realtime://transcript-delta" {
@@ -736,12 +894,25 @@ mod integration {
                 }
                 if name == "realtime://transcript-done" {
                     if let Some(t) = params.get("text").and_then(|t| t.as_str()) {
-                        transcript = t.to_string();
+                        // Accumulate: one hold is many turns. Assigning here —
+                        // which this used to do, mirroring the production bug —
+                        // keeps only the last sentence.
+                        if !turns.contains(&t.to_string()) {
+                            turns.push(t.to_string());
+                        }
+                        transcript = turns.join(" ");
                     }
                 }
             }
-            if !transcript.trim().is_empty() {
+            // Do NOT stop at the first turn: VAD splits the utterance, and
+            // leaving early is precisely how the last-turn-only bug hid here.
+            // Settle instead — quiet for 2s once at least one turn has landed.
+            if !turns.is_empty() && last_turn.elapsed() >= Duration::from_secs(2) {
                 break;
+            }
+            if turns.len() != seen_turns {
+                seen_turns = turns.len();
+                last_turn = Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -752,10 +923,546 @@ mod integration {
             eprintln!("[e2e]   {ms:>6}ms [{marker}] {text:?}");
         }
         eprintln!("[e2e] final transcript: {transcript:?}");
+        eprintln!("[e2e] server produced {} turn(s)", turns.len());
         assert!(
             !transcript.trim().is_empty(),
             "no user transcript arrived within 30s of streaming speech"
         );
         session.disconnect().await;
+    }
+
+    /// The commit path, end to end, over the live service.
+    ///
+    /// The test above watches raw server events; this one runs the real
+    /// `DictateState` — the thing that decides what gets typed. Server VAD
+    /// splits a multi-sentence dictation into several turns, and every turn has
+    /// to survive into the committed text. When each `transcript/done`
+    /// overwrote the last instead of appending, this is what came out:
+    ///
+    /// ```text
+    /// spoken:    안녕하세요. 지금 마이크 테스트를 하고 있습니다. 오늘 점심은 …
+    /// committed: 지금 마이크 테스트를 하고 있습니다.
+    /// ```
+    ///
+    /// Every sentence but one silently dropped, which reads as the transcriber
+    /// returning something else entirely. Set CODEX_MIC_TEST_PHRASES to a
+    /// `|`-separated list of fragments the commit must contain.
+    #[tokio::test]
+    async fn dictate_commit_keeps_every_turn_of_one_hold() {
+        if !enabled() {
+            eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
+            return;
+        }
+        let Ok(pcm_path) = std::env::var("CODEX_MIC_TEST_PCM") else {
+            eprintln!("skipping; set CODEX_MIC_TEST_PCM to a 48kHz mono pcm16le file");
+            return;
+        };
+        let pcm = std::fs::read(&pcm_path).expect("read test pcm");
+
+        let emitter: Emitter = Arc::new(|_: &str, _: Value| {});
+        let (session, _info) = RealtimeSession::connect(emitter).await.expect("connect");
+
+        // The real accumulator, fed by the real session.
+        let dictate = crate::dictate::DictateState::new();
+        dictate
+            .start_listening(session.subscribe())
+            .await
+            .expect("start listening");
+
+        session
+            .append_silence(SILENCE_LEAD)
+            .await
+            .expect("lead-in silence");
+
+        // 48 kHz fixture down to the session's 24 kHz, streamed at speaking pace.
+        let pcm: Vec<u8> = pcm
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let a = i16::from_le_bytes([c[0], c[1]]) as i32;
+                let b = i16::from_le_bytes([c[2], c[3]]) as i32;
+                (((a + b) / 2) as i16).to_le_bytes()
+            })
+            .collect();
+        let frame_bytes = (crate::realtime::SESSION_SAMPLE_RATE as usize / 50) * 2;
+        let mut ticker = tokio::time::interval(Duration::from_millis(20));
+        for chunk in pcm.chunks(frame_bytes) {
+            ticker.tick().await;
+            session.append_pcm(chunk).await.expect("append_pcm");
+        }
+
+        // Exactly what `stop_dictation` does at key-up. The clock starts here:
+        // this is the delay the user actually feels, between letting go of the
+        // hotkey and seeing text.
+        let key_up = Instant::now();
+        session.flush_tail(SILENCE_TAIL).await.expect("flush tail");
+        if crate::realtime::manual_turns() {
+            dictate.expect_turn().await;
+        }
+        // Mirror `stop_dictation` exactly: the session model's transcript when
+        // there is one, the side channel otherwise. Injection is deliberately
+        // not called — this must not type into the developer's screen.
+        let spoken = if crate::realtime::model_transcription() {
+            crate::realtime::transcribe_committed_audio(&session, MODEL_TRANSCRIBE_BUDGET)
+                .await
+                .ok()
+                .filter(|t| !t.trim().is_empty())
+        } else {
+            None
+        };
+        let fallback = dictate
+            .finish(crate::dictate::Timings::default())
+            .await
+            .expect("finish");
+        let committed = match spoken {
+            Some(t) => crate::dictate::classify(&t),
+            None => fallback,
+        };
+        let commit_ms = key_up.elapsed().as_millis();
+        session.disconnect().await;
+        eprintln!(
+            "[commit] mode={} latency={commit_ms}ms after key-up",
+            if crate::realtime::manual_turns() { "manual-turns" } else { "server-vad" }
+        );
+
+        let text = match &committed {
+            Committed::Typed(t) => t.clone(),
+            other => panic!("expected a typed commit, got {other:?}"),
+        };
+        eprintln!("[commit] {text:?}");
+
+        let expected = std::env::var("CODEX_MIC_TEST_PHRASES").unwrap_or_default();
+        let fragments: Vec<&str> = expected
+            .split('|')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if fragments.is_empty() {
+            eprintln!("[commit] set CODEX_MIC_TEST_PHRASES to assert on content");
+            return;
+        }
+        let missing: Vec<&&str> = fragments.iter().filter(|f| !text.contains(**f)).collect();
+        assert!(
+            missing.is_empty(),
+            "the commit dropped {missing:?}\n  committed: {text:?}"
+        );
+        eprintln!("[commit] all {} expected fragments survived", fragments.len());
+    }
+
+    /// Does asking the session model degrade as a session goes on?
+    ///
+    /// Every `response.create` appends to the conversation, and the model reads
+    /// the whole thing each time — unlike the transcription side channel, which
+    /// treats each utterance independently. A dictation session lives up to an
+    /// hour, so this checks the thing that would make the model path unusable:
+    /// latency creeping up, or an earlier dictation bleeding into a later one.
+    #[tokio::test]
+    async fn probe_model_transcription_over_a_long_session() {
+        if !enabled() {
+            eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
+            return;
+        }
+        // Several different utterances, cycled: repeating one recording could
+        // never reveal an earlier dictation bleeding into a later one.
+        let paths = std::env::var("CODEX_MIC_TEST_PCMS")
+            .or_else(|_| std::env::var("CODEX_MIC_TEST_PCM"))
+            .unwrap_or_default();
+        let clips: Vec<(String, Vec<u8>)> = paths
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| {
+                let raw = std::fs::read(p).ok()?;
+                let pcm = raw
+                    .chunks_exact(4)
+                    .flat_map(|c| {
+                        let a = i16::from_le_bytes([c[0], c[1]]) as i32;
+                        let b = i16::from_le_bytes([c[2], c[3]]) as i32;
+                        (((a + b) / 2) as i16).to_le_bytes()
+                    })
+                    .collect();
+                let name = std::path::Path::new(p)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string());
+                Some((name, pcm))
+            })
+            .collect();
+        if clips.is_empty() {
+            eprintln!("skipping; set CODEX_MIC_TEST_PCMS to comma-separated pcm paths");
+            return;
+        }
+        let rounds: usize = std::env::var("CODEX_MIC_ROUNDS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(5);
+
+        let emitter: Emitter = Arc::new(|_: &str, _: Value| {});
+        let (session, _) = RealtimeSession::connect(emitter).await.expect("connect");
+        let frame = (crate::realtime::SESSION_SAMPLE_RATE as usize / 50) * 2;
+
+        for round in 1..=rounds {
+            let (name, pcm) = &clips[(round - 1) % clips.len()];
+            // Faster than real time: this is about conversation growth, not
+            // capture pacing.
+            for chunk in pcm.chunks(frame) {
+                session.append_pcm(chunk).await.expect("append_pcm");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let key_up = Instant::now();
+            session.flush_tail(SILENCE_TAIL).await.expect("flush tail");
+            match crate::realtime::transcribe_committed_audio(&session, Duration::from_secs(20))
+                .await
+            {
+                Ok(t) => eprintln!(
+                    "[round {round}] {name:<10} {:>5}ms  {:?}",
+                    key_up.elapsed().as_millis(),
+                    t.trim()
+                ),
+                Err(e) => eprintln!("[round {round}] {name:<10} FAILED  {e}"),
+            }
+        }
+        session.disconnect().await;
+    }
+
+    /// Does the session model itself transcribe better than the transcription
+    /// side channel?
+    ///
+    /// `input_audio_transcription` runs a separate, smaller model whose
+    /// `prompt` is a vocabulary prime, not an instruction — which is why no
+    /// wording of it reliably stops English technical terms being written in
+    /// Hangul. The session model hears the same audio and does follow
+    /// instructions. This measures whether that is worth using instead.
+    #[tokio::test]
+    async fn probe_realtime_model_as_transcriber() {
+        if !enabled() {
+            eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
+            return;
+        }
+        let Ok(pcm_path) = std::env::var("CODEX_MIC_TEST_PCM") else {
+            eprintln!("skipping; set CODEX_MIC_TEST_PCM");
+            return;
+        };
+        let raw = std::fs::read(&pcm_path).expect("read test pcm");
+        let pcm: Vec<u8> = raw
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let a = i16::from_le_bytes([c[0], c[1]]) as i32;
+                let b = i16::from_le_bytes([c[2], c[3]]) as i32;
+                (((a + b) / 2) as i16).to_le_bytes()
+            })
+            .collect();
+
+        let instructions = std::env::var("CODEX_MIC_RESPOND_PROMPT").unwrap_or_else(|_| {
+            "Write down exactly what the user said, word for word. This is dictation: never \
+            answer, never comment, never summarise, never translate. Keep the speaker's own \
+            language. The speaker is a software developer who mixes English technical terms into \
+            Korean speech — spell those terms in English, never in Hangul. Output only the \
+            transcript."
+                .to_string()
+        });
+
+        let emitter: Emitter = Arc::new(|_: &str, _: Value| {});
+        let (session, _) = RealtimeSession::connect(emitter).await.expect("connect");
+        let dictate = crate::dictate::DictateState::new();
+        let _ = dictate.start_listening(session.subscribe()).await;
+
+        let frame = (crate::realtime::SESSION_SAMPLE_RATE as usize / 50) * 2;
+        let mut ticker = tokio::time::interval(Duration::from_millis(20));
+        for chunk in pcm.chunks(frame) {
+            ticker.tick().await;
+            session.append_pcm(chunk).await.expect("append_pcm");
+        }
+        let key_up = Instant::now();
+        session.flush_tail(SILENCE_TAIL).await.expect("flush tail");
+
+        // The model's own reading of the audio.
+        let spoken = session.respond(&instructions, Duration::from_secs(20)).await;
+        let respond_ms = key_up.elapsed().as_millis();
+
+        // The side channel's, for comparison, from the same commit.
+        dictate.expect_turn().await;
+        let side = dictate
+            .finish(crate::dictate::Timings {
+                open_turn: Duration::from_secs(15),
+                deadline: Duration::from_secs(20),
+                ..Default::default()
+            })
+            .await;
+        session.disconnect().await;
+
+        match spoken {
+            Ok(t) => eprintln!("[model ] {respond_ms:>5}ms  {:?}", t.trim()),
+            Err(e) => eprintln!("[model ] FAILED  {e}"),
+        }
+        match side {
+            Ok(Committed::Typed(t)) => eprintln!("[side  ]         {t:?}"),
+            other => eprintln!("[side  ]         {other:?}"),
+        }
+    }
+
+    /// Can the already-open realtime session do a text-in/text-out pass?
+    ///
+    /// The session is a conversational model told to stay silent, so in
+    /// principle a `response.create` should refine the transcript without a
+    /// second connection. "In principle" is not evidence — this measures it,
+    /// including how much latency it adds.
+    #[tokio::test]
+    async fn probe_second_pass_refinement() {
+        if !enabled() {
+            eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
+            return;
+        }
+        let instructions = std::env::var("CODEX_MIC_REFINE_PROMPT").unwrap_or_else(|_| {
+            "You clean up dictated Korean text. Korean speakers say English technical words \
+            out loud and the transcriber writes them in Hangul. Put those back into English \
+            spelling. Change NOTHING else: not a word, not an ending, not a particle, not \
+            punctuation. Never translate real Korean words. Reply with the corrected text only."
+                .to_string()
+        });
+        // Real transcriber output on the left, what was actually said on the
+        // right. The no-English cases are the ones that matter most: a cleanup
+        // pass that damages ordinary Korean is worse than no pass at all.
+        let cases = [
+            (
+                "이 API 엔드포인트를 프로덕션에 디플로이하고 코드 리뷰 요청해줘.",
+                "이 API endpoint를 production에 deploy하고 code review 요청해줘.",
+            ),
+            (
+                "이 브랜치를 메인에 머지하고 빌드 다시 돌려줘.",
+                "이 branch를 main에 merge하고 build 다시 돌려줘.",
+            ),
+            (
+                "레디스 캐시가 자꾸 타임아웃 나는데 로그 좀 봐줘.",
+                "Redis cache가 자꾸 timeout 나는데 로그 좀 봐줘.",
+            ),
+            // 배포 / 코드 / 정리 are ordinary Korean here, not transliterations.
+            (
+                "오늘 배포 일정 잡고 코드 정리 좀 하자.",
+                "오늘 배포 일정 잡고 코드 정리 좀 하자.",
+            ),
+            (
+                "점심 먹고 회의실에서 이야기하시죠.",
+                "점심 먹고 회의실에서 이야기하시죠.",
+            ),
+        ];
+
+        let emitter: Emitter = Arc::new(|_: &str, _: Value| {});
+        let (session, _) = RealtimeSession::connect(emitter).await.expect("connect");
+        let (mut matched, mut total) = (0, 0);
+        for (input, want) in cases {
+            let started = Instant::now();
+            total += 1;
+            match session
+                .refine_text(input, &instructions, Duration::from_secs(15))
+                .await
+            {
+                Ok(got) => {
+                    let got = got.trim();
+                    let ok = got == want;
+                    if ok {
+                        matched += 1;
+                    }
+                    eprintln!(
+                        "[refine] {} {:>5}ms\n  out  {got:?}\n  want {want:?}",
+                        if ok { "MATCH " } else { "DIFFER" },
+                        started.elapsed().as_millis()
+                    );
+                }
+                Err(e) => eprintln!("[refine] FAILED after {:?}: {e}", started.elapsed()),
+            }
+        }
+        eprintln!("[refine] score {matched}/{total}");
+        session.disconnect().await;
+    }
+
+    /// Which session models does this endpoint accept, and which
+    /// (session × transcription) pairs actually work?
+    ///
+    /// Both halves are server-side facts that change without notice, so they
+    /// are measured rather than assumed. Every pair transcribes the same
+    /// recording, so the output column is directly comparable.
+    #[tokio::test]
+    async fn probe_model_pairs() {
+        if !enabled() {
+            eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
+            return;
+        }
+        let Ok(pcm_path) = std::env::var("CODEX_MIC_TEST_PCM") else {
+            eprintln!("skipping; set CODEX_MIC_TEST_PCM");
+            return;
+        };
+        let raw = std::fs::read(&pcm_path).expect("read test pcm");
+        let pcm: Vec<u8> = raw
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let a = i16::from_le_bytes([c[0], c[1]]) as i32;
+                let b = i16::from_le_bytes([c[2], c[3]]) as i32;
+                (((a + b) / 2) as i16).to_le_bytes()
+            })
+            .collect();
+
+        let sessions = std::env::var("CODEX_MIC_REALTIME_CANDIDATES")
+            .unwrap_or_else(|_| crate::realtime::default_realtime_model().to_string());
+        let transcribers = std::env::var("CODEX_MIC_TRANSCRIBE_CANDIDATES")
+            .unwrap_or_else(|_| crate::realtime::default_transcription_model().to_string());
+
+        for session_model in sessions.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            std::env::set_var("CODEX_MIC_REALTIME_MODEL", session_model);
+            for transcriber in transcribers.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                std::env::set_var("CODEX_MIC_TRANSCRIBE_MODEL", transcriber);
+                let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+                let sink = errors.clone();
+                let emitter: Emitter = Arc::new(move |name: &str, params: Value| {
+                    if name == "realtime://error" {
+                        if let Some(m) = params.get("message").and_then(|m| m.as_str()) {
+                            sink.lock().unwrap().push(m.to_string());
+                        }
+                    }
+                });
+                let session = match RealtimeSession::connect(emitter).await {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        // Print the reason: a refusal often names what the
+                        // endpoint would have accepted instead.
+                        eprintln!("[pair] {session_model:<24} {transcriber:<34}   ---  {e}");
+                        // A session the endpoint will not open fails for every
+                        // transcriber; no point trying the rest.
+                        break;
+                    }
+                };
+                let dictate = crate::dictate::DictateState::new();
+                let _ = dictate.start_listening(session.subscribe()).await;
+                let frame = (crate::realtime::SESSION_SAMPLE_RATE as usize / 50) * 2;
+                for chunk in pcm.chunks(frame) {
+                    if session.append_pcm(chunk).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                let started = Instant::now();
+                let _ = session.flush_tail(SILENCE_TAIL).await;
+                dictate.expect_turn().await;
+                let out = dictate
+                    .finish(crate::dictate::Timings {
+                        open_turn: Duration::from_secs(15),
+                        deadline: Duration::from_secs(20),
+                        ..Default::default()
+                    })
+                    .await;
+                let ms = started.elapsed().as_millis();
+                session.disconnect().await;
+                match out {
+                    Ok(Committed::Typed(t)) => {
+                        eprintln!("[pair] {session_model:<24} {transcriber:<34} {ms:>5}ms {t:?}")
+                    }
+                    other => {
+                        let why = errors
+                            .lock()
+                            .unwrap()
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| format!("{other:?}"));
+                        eprintln!("[pair] {session_model:<24} {transcriber:<34}   ---  {why}")
+                    }
+                }
+            }
+        }
+        std::env::remove_var("CODEX_MIC_REALTIME_MODEL");
+        std::env::remove_var("CODEX_MIC_TRANSCRIBE_MODEL");
+    }
+
+    /// Ask the live endpoint which transcription models it actually accepts,
+    /// and what each one makes of identical audio.
+    ///
+    /// Not an assertion — a report. Which models a deployment will take is a
+    /// server-side fact that changes without notice, so it is worth measuring
+    /// rather than hardcoding from memory. Candidates come from
+    /// `CODEX_MIC_TRANSCRIBE_CANDIDATES` (comma-separated) or the list below.
+    #[tokio::test]
+    async fn probe_transcription_models() {
+        if !enabled() {
+            eprintln!("skipping; set CODEX_MIC_INTEGRATION=1 to run");
+            return;
+        }
+        let Ok(pcm_path) = std::env::var("CODEX_MIC_TEST_PCM") else {
+            eprintln!("skipping; set CODEX_MIC_TEST_PCM to a 48kHz mono pcm16le file");
+            return;
+        };
+        let raw = std::fs::read(&pcm_path).expect("read test pcm");
+        let pcm: Vec<u8> = raw
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let a = i16::from_le_bytes([c[0], c[1]]) as i32;
+                let b = i16::from_le_bytes([c[2], c[3]]) as i32;
+                (((a + b) / 2) as i16).to_le_bytes()
+            })
+            .collect();
+
+        let candidates = std::env::var("CODEX_MIC_TRANSCRIBE_CANDIDATES").unwrap_or_else(|_| {
+            "gpt-4o-transcribe,gpt-4o-mini-transcribe,whisper-1,\
+             gpt-4o-transcribe-latest,gpt-4o-transcribe-diarize"
+                .to_string()
+        });
+
+        for model in candidates.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            std::env::set_var("CODEX_MIC_TRANSCRIBE_MODEL", model);
+            let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+            let sink = errors.clone();
+            let emitter: Emitter = Arc::new(move |name: &str, params: Value| {
+                if name == "realtime://error" {
+                    if let Some(m) = params.get("message").and_then(|m| m.as_str()) {
+                        sink.lock().unwrap().push(m.to_string());
+                    }
+                }
+            });
+
+            let Ok((session, _)) = RealtimeSession::connect(emitter).await else {
+                eprintln!("[probe] {model:<28} CONNECT FAILED");
+                continue;
+            };
+            let dictate = crate::dictate::DictateState::new();
+            let _ = dictate.start_listening(session.subscribe()).await;
+
+            let frame = (crate::realtime::SESSION_SAMPLE_RATE as usize / 50) * 2;
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            let mut send_failed = false;
+            for chunk in pcm.chunks(frame) {
+                ticker.tick().await;
+                if session.append_pcm(chunk).await.is_err() {
+                    send_failed = true;
+                    break;
+                }
+            }
+            let started = Instant::now();
+            let _ = session.flush_tail(SILENCE_TAIL).await;
+            dictate.expect_turn().await;
+            // Generous windows: the point is to measure how long each model
+            // really takes, not to re-impose the production deadline on models
+            // that may be slower than it.
+            let out = dictate
+                .finish(crate::dictate::Timings {
+                    deadline: Duration::from_secs(25),
+                    quiet: Duration::from_secs(3),
+                    open_turn: Duration::from_secs(20),
+                    settle: Duration::from_secs(1),
+                    no_event: Duration::from_secs(10),
+                    poll: Duration::from_millis(25),
+                })
+                .await;
+            let ms = started.elapsed().as_millis();
+            session.disconnect().await;
+
+            let errs = errors.lock().unwrap().clone();
+            match out {
+                Ok(Committed::Typed(t)) if !send_failed => {
+                    eprintln!("[probe] {model:<28} OK {ms:>5}ms  {t:?}");
+                }
+                other => {
+                    let why = errs.first().cloned().unwrap_or_else(|| format!("{other:?}"));
+                    eprintln!("[probe] {model:<28} REJECTED  {why}");
+                }
+            }
+        }
+        std::env::remove_var("CODEX_MIC_TRANSCRIBE_MODEL");
     }
 }

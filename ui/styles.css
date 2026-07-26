@@ -138,6 +138,17 @@ body {
 }
 .row select option { background: #12161c; }
 
+/* A note under a control. Indented to the control column so it reads as
+   belonging to the row above rather than as a new setting. */
+.row-note {
+  margin: -4px 0 2px 122px;
+  color: #8a93a2;
+  font-size: 11px;
+  line-height: 1.35;
+  min-height: 15px;
+}
+.row-note:empty { display: none; }
+
 /* Checkbox rows read as one sentence, so their label is not part of the
    fixed label column. */
 .row.check { justify-content: flex-start; gap: 8px; cursor: pointer; }

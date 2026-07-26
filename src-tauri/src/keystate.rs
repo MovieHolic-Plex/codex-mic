@@ -14,6 +14,7 @@
 use crate::config::ActivationMode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tauri_plugin_global_shortcut::Code;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -62,7 +63,6 @@ impl Machine {
         }
     }
 
-    #[cfg(test)]
     pub fn phase(&self) -> Phase {
         self.phase
     }
@@ -188,6 +188,134 @@ pub fn hotkey_is_capslock(hotkey: &str) -> bool {
 /// True when the caps state changed across a dictation and must be put back.
 pub fn caps_restore_needed(before: Option<bool>, after: Option<bool>) -> bool {
     matches!((before, after), (Some(a), Some(b)) if a != b)
+}
+
+/// Windows virtual-key code for a shortcut's main key.
+///
+/// Mirrors `global-hotkey`'s own `key_to_vk`, which is private to that crate.
+/// We need the same number it hands to `RegisterHotKey` so we can ask Windows
+/// directly whether the key is still down — see `winkeys::key_is_down` and the
+/// release watcher in `lib.rs`. `None` means "not a key we can poll", which
+/// disables the physical check rather than breaking the hotkey.
+pub fn code_to_vk(code: &Code) -> Option<u16> {
+    Some(match code {
+        Code::KeyA => 0x41,
+        Code::KeyB => 0x42,
+        Code::KeyC => 0x43,
+        Code::KeyD => 0x44,
+        Code::KeyE => 0x45,
+        Code::KeyF => 0x46,
+        Code::KeyG => 0x47,
+        Code::KeyH => 0x48,
+        Code::KeyI => 0x49,
+        Code::KeyJ => 0x4A,
+        Code::KeyK => 0x4B,
+        Code::KeyL => 0x4C,
+        Code::KeyM => 0x4D,
+        Code::KeyN => 0x4E,
+        Code::KeyO => 0x4F,
+        Code::KeyP => 0x50,
+        Code::KeyQ => 0x51,
+        Code::KeyR => 0x52,
+        Code::KeyS => 0x53,
+        Code::KeyT => 0x54,
+        Code::KeyU => 0x55,
+        Code::KeyV => 0x56,
+        Code::KeyW => 0x57,
+        Code::KeyX => 0x58,
+        Code::KeyY => 0x59,
+        Code::KeyZ => 0x5A,
+        Code::Digit0 => 0x30,
+        Code::Digit1 => 0x31,
+        Code::Digit2 => 0x32,
+        Code::Digit3 => 0x33,
+        Code::Digit4 => 0x34,
+        Code::Digit5 => 0x35,
+        Code::Digit6 => 0x36,
+        Code::Digit7 => 0x37,
+        Code::Digit8 => 0x38,
+        Code::Digit9 => 0x39,
+        Code::Equal => 0xBB,
+        Code::Comma => 0xBC,
+        Code::Minus => 0xBD,
+        Code::Period => 0xBE,
+        Code::Semicolon => 0xBA,
+        Code::Slash => 0xBF,
+        Code::Backquote => 0xC0,
+        Code::BracketLeft => 0xDB,
+        Code::Backslash => 0xDC,
+        Code::BracketRight => 0xDD,
+        Code::Quote => 0xDE,
+        Code::Backspace => 0x08,
+        Code::Tab => 0x09,
+        Code::Space => 0x20,
+        Code::Enter | Code::NumpadEnter => 0x0D,
+        Code::CapsLock => 0x14,
+        Code::Escape => 0x1B,
+        Code::PageUp => 0x21,
+        Code::PageDown => 0x22,
+        Code::End => 0x23,
+        Code::Home => 0x24,
+        Code::ArrowLeft => 0x25,
+        Code::ArrowUp => 0x26,
+        Code::ArrowRight => 0x27,
+        Code::ArrowDown => 0x28,
+        Code::PrintScreen => 0x2C,
+        Code::Insert => 0x2D,
+        Code::Delete => 0x2E,
+        Code::F1 => 0x70,
+        Code::F2 => 0x71,
+        Code::F3 => 0x72,
+        Code::F4 => 0x73,
+        Code::F5 => 0x74,
+        Code::F6 => 0x75,
+        Code::F7 => 0x76,
+        Code::F8 => 0x77,
+        Code::F9 => 0x78,
+        Code::F10 => 0x79,
+        Code::F11 => 0x7A,
+        Code::F12 => 0x7B,
+        Code::F13 => 0x7C,
+        Code::F14 => 0x7D,
+        Code::F15 => 0x7E,
+        Code::F16 => 0x7F,
+        Code::F17 => 0x80,
+        Code::F18 => 0x81,
+        Code::F19 => 0x82,
+        Code::F20 => 0x83,
+        Code::F21 => 0x84,
+        Code::F22 => 0x85,
+        Code::F23 => 0x86,
+        Code::F24 => 0x87,
+        Code::NumLock => 0x90,
+        Code::Numpad0 => 0x60,
+        Code::Numpad1 => 0x61,
+        Code::Numpad2 => 0x62,
+        Code::Numpad3 => 0x63,
+        Code::Numpad4 => 0x64,
+        Code::Numpad5 => 0x65,
+        Code::Numpad6 => 0x66,
+        Code::Numpad7 => 0x67,
+        Code::Numpad8 => 0x68,
+        Code::Numpad9 => 0x69,
+        Code::NumpadAdd => 0x6B,
+        Code::NumpadDecimal => 0x6E,
+        Code::NumpadDivide => 0x6F,
+        Code::NumpadEqual => 0x45,
+        Code::NumpadMultiply => 0x6A,
+        Code::NumpadSubtract => 0x6D,
+        Code::ScrollLock => 0x91,
+        Code::AudioVolumeDown => 0xAE,
+        Code::AudioVolumeUp => 0xAF,
+        Code::AudioVolumeMute => 0xAD,
+        Code::MediaPlay => 0xFA,
+        Code::MediaPause | Code::Pause => 0x13,
+        Code::MediaPlayPause => 0xB3,
+        Code::MediaStop => 0xB2,
+        Code::MediaTrackNext => 0xB0,
+        Code::MediaTrackPrevious => 0xB1,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -333,6 +461,56 @@ mod tests {
         assert_eq!(m.press(PushToTalk), Action::Start);
         assert_eq!(m.started(), Action::Ignore);
         assert_eq!(m.phase(), Phase::Recording);
+    }
+
+    /// The phantom key-up this whole release-watcher exists for: a `Released`
+    /// arriving before the recording is live queues a stop, and `started()`
+    /// commits an empty dictation. The machine is right to do that — a real tap
+    /// must commit — which is why the bogus release has to be rejected at the
+    /// hotkey handler, before it ever reaches here.
+    #[test]
+    fn a_release_during_startup_always_commits() {
+        let mut m = Machine::new();
+        m.press(PushToTalk);
+        assert_eq!(m.release(), Action::Ignore);
+        assert_eq!(m.started(), Action::Stop, "an empty commit, by design");
+    }
+
+    /// The VK numbers must match what `RegisterHotKey` was given, or
+    /// `GetAsyncKeyState` would be polling some unrelated key and the watcher
+    /// would either never fire or fire immediately.
+    #[test]
+    fn hotkey_keys_map_to_their_virtual_key_codes() {
+        assert_eq!(code_to_vk(&Code::KeyE), Some(0x45)); // the default hotkey
+        assert_eq!(code_to_vk(&Code::KeyA), Some(0x41));
+        assert_eq!(code_to_vk(&Code::KeyZ), Some(0x5A));
+        assert_eq!(code_to_vk(&Code::Digit0), Some(0x30));
+        assert_eq!(code_to_vk(&Code::CapsLock), Some(0x14));
+        assert_eq!(code_to_vk(&Code::Space), Some(0x20));
+        assert_eq!(code_to_vk(&Code::F9), Some(0x78));
+        assert_eq!(code_to_vk(&Code::F24), Some(0x87));
+        // Unpollable: the physical check stays off rather than guessing.
+        assert_eq!(code_to_vk(&Code::Fn), None);
+    }
+
+    /// Every key the settings panel can produce a shortcut for must be
+    /// pollable, or push-to-talk silently falls back to the buggy library
+    /// release for that key.
+    #[test]
+    fn every_letter_digit_and_function_key_is_pollable() {
+        for c in [
+            Code::KeyB, Code::KeyC, Code::KeyD, Code::KeyF, Code::KeyG, Code::KeyH,
+            Code::KeyI, Code::KeyJ, Code::KeyK, Code::KeyL, Code::KeyM, Code::KeyN,
+            Code::KeyO, Code::KeyP, Code::KeyQ, Code::KeyR, Code::KeyS, Code::KeyT,
+            Code::KeyU, Code::KeyV, Code::KeyW, Code::KeyX, Code::KeyY,
+            Code::Digit1, Code::Digit5, Code::Digit9,
+            Code::F1, Code::F5, Code::F12,
+            Code::Enter, Code::Tab, Code::Escape, Code::Backspace,
+            Code::ArrowUp, Code::ArrowDown, Code::Home, Code::End,
+            Code::Numpad0, Code::Numpad9, Code::ScrollLock, Code::NumLock,
+        ] {
+            assert!(code_to_vk(&c).is_some(), "{c:?} is not pollable");
+        }
     }
 
     #[test]

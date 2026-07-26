@@ -51,6 +51,14 @@ pub struct Config {
     /// Append one space after the injected text.
     pub append_trailing_space: bool,
     pub language: Language,
+    /// Realtime session model — the WebSocket endpoint. Empty means default.
+    pub realtime_model: String,
+    /// Input-transcription model. Empty means the built-in default.
+    ///
+    /// Which names the endpoint accepts is a server-side fact that changes
+    /// without notice, so this is a free string validated by the server rather
+    /// than an enum that would need a release to widen.
+    pub transcribe_model: String,
     /// Input device name (substring match). None = system default.
     pub mic_device: Option<String>,
     /// Capture gain in dB. Realtek/USB mics need ~20; 0 disables the boost.
@@ -80,6 +88,8 @@ impl Default for Config {
             restore_clipboard: true,
             append_trailing_space: false,
             language: Language::Auto,
+            realtime_model: String::new(),
+            transcribe_model: String::new(),
             mic_device: None,
             mic_gain_db: 20.0,
             hallucination_filter: true,
@@ -87,6 +97,16 @@ impl Default for Config {
             window_y: None,
         }
     }
+}
+
+/// Drop a UTF-8 byte-order mark.
+///
+/// `serde_json` rejects one outright, and on Windows a BOM is what you get from
+/// Notepad and from PowerShell's `Set-Content -Encoding UTF8`. Without this,
+/// opening the config in an editor and saving it silently reset every setting
+/// to defaults — the file still looked perfectly fine to the user.
+fn strip_bom(raw: &str) -> &str {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw)
 }
 
 fn config_path() -> PathBuf {
@@ -106,7 +126,7 @@ impl Config {
     pub fn load() -> Self {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            Ok(raw) => serde_json::from_str(strip_bom(&raw)).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, path = %path.display(), "config unreadable; using defaults");
                 Self::default()
             }),
@@ -196,6 +216,73 @@ mod tests {
         assert!(back.append_trailing_space);
         assert_eq!(back.language, Language::Korean);
         assert_eq!(back.mic_device.as_deref(), Some("USB麦克风"));
+    }
+
+    /// Empty means "use the built-in default", so a config written before this
+    /// field existed keeps working and does not pin an old model forever.
+    #[test]
+    fn transcribe_model_defaults_to_empty_and_round_trips() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.transcribe_model, "");
+
+        let cfg = Config {
+            transcribe_model: "gpt-4o-transcribe".into(),
+            ..Default::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.transcribe_model, "gpt-4o-transcribe");
+    }
+
+    /// Each dropdown must offer its built-in default, or picking "기본값" and
+    /// a named model would be indistinguishable to the user.
+    #[test]
+    fn the_default_models_are_offered_in_the_settings_lists() {
+        assert!(
+            crate::realtime::TRANSCRIPTION_MODELS
+                .iter()
+                .any(|(id, _)| *id == crate::realtime::default_transcription_model()),
+            "the default transcription model is missing from its dropdown"
+        );
+        assert!(
+            crate::realtime::REALTIME_MODELS
+                .iter()
+                .any(|(id, _)| *id == crate::realtime::default_realtime_model()),
+            "the default session model is missing from its dropdown"
+        );
+    }
+
+    /// Both model fields default to empty and survive a round trip, so a config
+    /// written by an older build never pins a stale model.
+    #[test]
+    fn realtime_model_defaults_to_empty_and_round_trips() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.realtime_model, "");
+
+        let cfg = Config {
+            realtime_model: "gpt-realtime-mini".into(),
+            ..Default::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.realtime_model, "gpt-realtime-mini");
+    }
+
+    /// Editing the config on Windows must not wipe it. Notepad and
+    /// `Set-Content -Encoding UTF8` both prepend a BOM, `serde_json` refuses
+    /// it, and the fallback to defaults threw away every setting the user had.
+    #[test]
+    fn a_byte_order_mark_does_not_reset_the_config() {
+        let json = r#"{"hotkey":"F9","mic_device":"Realtek","mic_gain_db":12.0}"#;
+        let with_bom = format!("\u{feff}{json}");
+        assert!(
+            serde_json::from_str::<Config>(&with_bom).is_err(),
+            "the BOM really is what serde rejects"
+        );
+        let cfg: Config = serde_json::from_str(strip_bom(&with_bom)).expect("parses once stripped");
+        assert_eq!(cfg.hotkey, "F9");
+        assert_eq!(cfg.mic_device.as_deref(), Some("Realtek"));
+        assert_eq!(cfg.mic_gain_db, 12.0);
+        // Files without a BOM are untouched.
+        assert_eq!(strip_bom(json), json);
     }
 
     #[test]

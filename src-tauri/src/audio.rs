@@ -14,6 +14,91 @@ pub const TARGET_SAMPLE_RATE: u32 = 24_000;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Mirror everything sent to the realtime session into a playable WAV.
+///
+/// Set `CODEX_MIC_DEBUG_DUMP_WAV` to a path. This is the only way to settle
+/// "the transcript is wrong" arguments: if the dump sounds like speech, the
+/// capture chain is fine and the problem is upstream at the server or in how we
+/// cut turns; if it does not, it is ours. The header is rewritten on every
+/// append, so the file is valid even if the app is killed mid-recording.
+pub mod dump {
+    use std::fs::File;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::{Mutex, OnceLock};
+    use tracing::{info, warn};
+
+    /// Bytes of PCM written so far, used to patch the two WAV size fields.
+    struct Sink {
+        file: File,
+        written: u32,
+    }
+
+    static SINK: OnceLock<Option<Mutex<Sink>>> = OnceLock::new();
+
+    fn sink() -> &'static Option<Mutex<Sink>> {
+        SINK.get_or_init(|| {
+            let path = std::env::var("CODEX_MIC_DEBUG_DUMP_WAV").ok()?;
+            match File::create(&path) {
+                Ok(mut file) => {
+                    if let Err(e) = file.write_all(&header(0)) {
+                        warn!(error = %e, "debug dump: header write failed");
+                        return None;
+                    }
+                    info!(path, "debug dump: writing sent audio to WAV");
+                    Some(Mutex::new(Sink { file, written: 0 }))
+                }
+                Err(e) => {
+                    warn!(error = %e, path, "debug dump: could not create file");
+                    None
+                }
+            }
+        })
+    }
+
+    /// 44-byte canonical WAV header for 24 kHz mono PCM16LE.
+    fn header(data_len: u32) -> [u8; 44] {
+        let rate = super::TARGET_SAMPLE_RATE;
+        let byte_rate = rate * 2;
+        let mut h = [0u8; 44];
+        h[0..4].copy_from_slice(b"RIFF");
+        h[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
+        h[8..12].copy_from_slice(b"WAVE");
+        h[12..16].copy_from_slice(b"fmt ");
+        h[16..20].copy_from_slice(&16u32.to_le_bytes()); // PCM chunk size
+        h[20..22].copy_from_slice(&1u16.to_le_bytes()); // format: PCM
+        h[22..24].copy_from_slice(&1u16.to_le_bytes()); // channels: mono
+        h[24..28].copy_from_slice(&rate.to_le_bytes());
+        h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+        h[32..34].copy_from_slice(&2u16.to_le_bytes()); // block align
+        h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits per sample
+        h[36..40].copy_from_slice(b"data");
+        h[40..44].copy_from_slice(&data_len.to_le_bytes());
+        h
+    }
+
+    #[cfg(test)]
+    pub fn header_for_test(data_len: u32) -> [u8; 44] {
+        header(data_len)
+    }
+
+    /// Append PCM16LE bytes. A no-op unless the env var is set.
+    pub fn write(pcm: &[u8]) {
+        let Some(lock) = sink() else { return };
+        let mut sink = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sink.file.write_all(pcm).is_err() {
+            return;
+        }
+        sink.written = sink.written.saturating_add(pcm.len() as u32);
+        // Keep the sizes honest so the file plays even if we never close it.
+        let patched = header(sink.written);
+        let _ = sink
+            .file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| sink.file.write_all(&patched))
+            .and_then(|_| sink.file.seek(SeekFrom::End(0)));
+    }
+}
+
 /// Capture gain comes from config (`mic_gain_db`). USB/laptop microphones
 /// routinely deliver -40 dBFS speech, which the realtime VAD never fires on —
 /// verified live: both this machine's USB mic and Realtek array produced
@@ -335,6 +420,39 @@ fn capture_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dump is the diagnostic of last resort, so a malformed header would
+    /// waste exactly the debugging session it exists for.
+    #[test]
+    fn wav_header_describes_24k_mono_pcm16() {
+        let h = dump::header_for_test(48_000);
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(&h[8..12], b"WAVE");
+        assert_eq!(&h[36..40], b"data");
+        // RIFF size is everything after the first 8 bytes.
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 36 + 48_000);
+        assert_eq!(u32::from_le_bytes(h[40..44].try_into().unwrap()), 48_000);
+        assert_eq!(u16::from_le_bytes(h[20..22].try_into().unwrap()), 1, "PCM");
+        assert_eq!(u16::from_le_bytes(h[22..24].try_into().unwrap()), 1, "mono");
+        assert_eq!(
+            u32::from_le_bytes(h[24..28].try_into().unwrap()),
+            TARGET_SAMPLE_RATE
+        );
+        assert_eq!(u16::from_le_bytes(h[34..36].try_into().unwrap()), 16, "bits");
+        // byte rate and block align must agree with mono 16-bit.
+        assert_eq!(
+            u32::from_le_bytes(h[28..32].try_into().unwrap()),
+            TARGET_SAMPLE_RATE * 2
+        );
+        assert_eq!(u16::from_le_bytes(h[32..34].try_into().unwrap()), 2);
+    }
+
+    /// Without the env var the dump must cost nothing and touch no disk.
+    #[test]
+    fn dump_is_inert_when_unconfigured() {
+        assert!(std::env::var("CODEX_MIC_DEBUG_DUMP_WAV").is_err());
+        dump::write(&[0u8; 64]);
+    }
 
     #[test]
     fn gain_boosts_quiet_signal_without_clipping() {

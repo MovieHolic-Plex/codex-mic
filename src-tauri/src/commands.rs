@@ -117,7 +117,12 @@ async fn set_config(
     if previous.hotkey != config.hotkey || previous.settings_hotkey != config.settings_hotkey {
         crate::apply_hotkeys(&app)?;
     }
-    if previous.language != config.language {
+    // Both are baked into `session.update` at connect time, so an open session
+    // would keep using the old ones until it aged out.
+    if previous.language != config.language
+        || previous.transcribe_model != config.transcribe_model
+        || previous.realtime_model != config.realtime_model
+    {
         if let Some(s) = state.session.lock().await.take() {
             s.disconnect().await;
         }
@@ -130,6 +135,31 @@ async fn set_config(
 #[tauri::command]
 async fn list_mics() -> Result<Vec<String>, String> {
     Ok(crate::audio::list_input_devices())
+}
+
+/// Transcription models for the settings dropdown, each with a one-line note
+/// on how it actually behaved when measured.
+#[tauri::command]
+async fn list_transcribe_models() -> Result<Vec<serde_json::Value>, String> {
+    let default = crate::realtime::default_transcription_model();
+    Ok(crate::realtime::TRANSCRIPTION_MODELS
+        .iter()
+        .map(|(id, note)| {
+            serde_json::json!({ "id": id, "note": note, "is_default": *id == default })
+        })
+        .collect())
+}
+
+/// Realtime session models for the settings dropdown.
+#[tauri::command]
+async fn list_realtime_models() -> Result<Vec<serde_json::Value>, String> {
+    let default = crate::realtime::default_realtime_model();
+    Ok(crate::realtime::REALTIME_MODELS
+        .iter()
+        .map(|(id, note)| {
+            serde_json::json!({ "id": id, "note": note, "is_default": *id == default })
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -191,6 +221,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
             has_oauth,
             get_config,
             set_config,
+            list_transcribe_models,
+            list_realtime_models,
             list_mics,
             close_settings,
             toggle_settings,

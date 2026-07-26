@@ -70,6 +70,34 @@ fn now_secs() -> u64 {
 /// (or nearly). Errors are phrased for the pill UI: they tell the user exactly
 /// what to run.
 pub async fn ensure_fresh_token() -> Result<OAuthTokens, String> {
+    load_token(false).await
+}
+
+/// Exchange the refresh token even though the access token still looks valid.
+///
+/// Local expiry is not the only way a token dies: the server can invalidate one
+/// outright ("Your authentication token has been invalidated. Please try
+/// signing in again."), and its `exp` claim keeps saying it is fine for days
+/// afterwards. Refreshing only on local expiry left the app hard-stuck for as
+/// long as the dead JWT claimed to live — observed with a token whose `exp` was
+/// ten days out.
+pub async fn force_refresh() -> Result<OAuthTokens, String> {
+    load_token(true).await
+}
+
+/// True when a connection failure is the server rejecting our credentials, and
+/// so is worth one forced refresh rather than being reported to the user.
+pub fn is_auth_rejection(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("invalidated")
+        || m.contains("unauthorized")
+        || m.contains("invalid_api_key")
+        || m.contains("invalid authentication")
+        || m.contains("expired")
+        || m.contains("401")
+}
+
+async fn load_token(force: bool) -> Result<OAuthTokens, String> {
     let path = auth_path()?;
     let raw = std::fs::read_to_string(&path).map_err(|_| {
         "no Codex login found — run `codex login` once, then restart codex-mic".to_string()
@@ -91,9 +119,10 @@ pub async fn ensure_fresh_token() -> Result<OAuthTokens, String> {
         return Err("auth.json has no access token — run `codex login` again".to_string());
     }
 
-    let fresh = jwt_exp(&access_token)
-        .map(|exp| exp > now_secs() + EXPIRY_MARGIN_SECS)
-        .unwrap_or(false);
+    let fresh = !force
+        && jwt_exp(&access_token)
+            .map(|exp| exp > now_secs() + EXPIRY_MARGIN_SECS)
+            .unwrap_or(false);
     if fresh {
         return Ok(OAuthTokens {
             access_token,
@@ -186,6 +215,37 @@ mod tests {
     fn fake_jwt(payload: &str) -> String {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
         format!("aaa.{b64}.ccc")
+    }
+
+    #[test]
+    /// The message that left the app stuck: the server invalidated the token
+    /// while its `exp` claim was still ten days out, so nothing local knew to
+    /// refresh.
+    #[test]
+    fn server_side_invalidation_is_recognised_as_an_auth_rejection() {
+        assert!(is_auth_rejection(
+            "Your authentication token has been invalidated. Please try signing in again."
+        ));
+        assert!(is_auth_rejection("Unauthorized"));
+        assert!(is_auth_rejection("invalid authentication credentials"));
+        assert!(is_auth_rejection("HTTP 401"));
+        assert!(is_auth_rejection("token expired"));
+    }
+
+    /// Failures that a new token cannot fix must not trigger a pointless
+    /// refresh — refreshes rotate the stored credentials, so retrying on
+    /// unrelated errors churns `auth.json` for nothing.
+    #[test]
+    fn unrelated_failures_do_not_trigger_a_refresh() {
+        for m in [
+            "Your session hit the maximum duration of 60 minutes.",
+            "buffer too small",
+            "rate limit exceeded",
+            "internal server error",
+            "The 'prompt' parameter is not supported for this model.",
+        ] {
+            assert!(!is_auth_rejection(m), "{m} must not look like an auth failure");
+        }
     }
 
     #[test]

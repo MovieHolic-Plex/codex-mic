@@ -14,12 +14,26 @@ use tracing::{info, warn};
 const MODIFIER_GRACE: Duration = Duration::from_millis(600);
 
 /// Everything the accumulator has heard about the current dictation.
+///
+/// One hold is not one turn. Server VAD closes a turn after
+/// `silence_duration_ms` of quiet (500 ms), so an ordinary sentence pause
+/// splits a single dictation into several turns, each with its own delta
+/// stream and its own `transcript/done`. Treating a `done` as *the* transcript
+/// — which this used to do — kept only the last segment and threw the rest of
+/// the sentence away.
 #[derive(Debug, Default)]
 struct Incoming {
-    /// Concatenated `transcript/delta` fragments.
-    text: String,
-    /// The authoritative full transcript from `turn.done`, when it arrives.
-    done: Option<String>,
+    /// Transcripts of the turns the server has already finished, in order.
+    committed: String,
+    /// Deltas for the turn still in flight. Superseded by that turn's `done`.
+    pending: String,
+    /// How many turns have completed.
+    turns: usize,
+    /// VAD has opened a turn that has not produced its transcript yet. Between
+    /// speech ending and the transcript arriving there are no deltas at all, so
+    /// without this the commit cannot tell "nothing more is coming" from
+    /// "transcription is still running".
+    speech_open: bool,
     /// When the last transcript event landed — drives the quiet-window commit.
     last: Option<Instant>,
     /// Whether any transcript event arrived at all this dictation.
@@ -32,11 +46,39 @@ impl Incoming {
         self.last = Some(Instant::now());
     }
 
-    /// The best transcript available: `turn.done` if the server sent one,
-    /// otherwise the accumulated deltas.
-    fn resolve(self) -> String {
-        self.done.unwrap_or(self.text)
+    /// Close the current turn with its authoritative transcript.
+    ///
+    /// The `done` text is the trustworthy version of the deltas we accumulated
+    /// for *this* turn, so it replaces `pending` — and appends to, rather than
+    /// replaces, the turns that came before it.
+    fn finish_turn(&mut self, text: &str) {
+        self.pending.clear();
+        self.speech_open = false;
+        self.turns += 1;
+        append_segment(&mut self.committed, text);
+        self.mark();
     }
+
+    /// Everything heard so far: the finished turns plus the turn in flight.
+    fn resolve(self) -> String {
+        let mut out = self.committed;
+        append_segment(&mut out, &self.pending);
+        out
+    }
+}
+
+/// Join transcript segments with a single space. Segments are whole utterances
+/// split apart by a VAD pause, so they need a separator, but the server already
+/// pads its own with spaces often enough that blind concatenation double-spaces.
+fn append_segment(out: &mut String, segment: &str) {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(segment);
 }
 
 type Shared = Arc<Mutex<Incoming>>;
@@ -51,8 +93,23 @@ type Shared = Arc<Mutex<Incoming>>;
 pub struct Timings {
     /// Hard ceiling on the wait.
     pub deadline: Duration,
-    /// Commit once the transcript has been quiet this long.
+    /// Commit once a turn's deltas have stalled this long without its `done`.
     pub quiet: Duration,
+    /// How long a turn VAD has opened is given to produce its transcript.
+    ///
+    /// Longer than `quiet` because this window covers the whole tail of the
+    /// pipeline: VAD still needs its `silence_duration_ms` to close the turn,
+    /// and only then does transcription run. Measured from the last transcript
+    /// event, ~1s is typical, so a 900 ms window drops the final sentence of
+    /// every dictation that ends on a pause.
+    pub open_turn: Duration,
+    /// Commit this long after a turn completes with nothing following it.
+    ///
+    /// A completed turn is not the end of the dictation — VAD splits one hold
+    /// into several — so the wait cannot stop the moment a `done` lands. It
+    /// waits out this window instead, long enough for the next turn's first
+    /// delta to appear if there is one, short enough not to be felt.
+    pub settle: Duration,
     /// Give up early if not one transcript event ever arrived.
     pub no_event: Duration,
     /// Poll granularity.
@@ -62,8 +119,14 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Self {
         Self {
-            deadline: Duration::from_millis(3500),
+            deadline: Duration::from_millis(10_000),
             quiet: Duration::from_millis(900),
+            // Measured key-up-to-transcript on live audio is 1.7-1.9 s, so the
+            // old 1800 ms sat exactly on the boundary. This window costs
+            // nothing when things work — the transcript arriving exits through
+            // `settle` — and only bounds the case where it never comes.
+            open_turn: Duration::from_millis(5_000),
+            settle: Duration::from_millis(300),
             no_event: Duration::from_millis(1500),
             poll: Duration::from_millis(25),
         }
@@ -133,7 +196,23 @@ impl DictateState {
 
     /// Settle the transcript and inject it at the cursor.
     pub async fn stop_listening(&self) -> Result<Committed, String> {
-        let outcome = self.finish(Timings::default()).await?;
+        self.stop_listening_with(None).await
+    }
+
+    /// As [`Self::stop_listening`], but preferring a transcript produced
+    /// elsewhere — the session model's own reading of the audio.
+    ///
+    /// The side channel is still drained either way: it settles the accumulator
+    /// and stands in whenever the model returns nothing.
+    pub async fn stop_listening_with(
+        &self,
+        preferred: Option<String>,
+    ) -> Result<Committed, String> {
+        let fallback = self.finish(Timings::default()).await?;
+        let outcome = match preferred {
+            Some(text) if !text.trim().is_empty() => classify(&text),
+            _ => fallback,
+        };
         if let Committed::Typed(text) = &outcome {
             // enigo drives SendInput and arboard talks to the OS clipboard —
             // both block; never run them on an async worker.
@@ -152,10 +231,11 @@ impl DictateState {
     /// can exercise the whole timing path without typing into the developer's
     /// screen.
     ///
-    /// The wait ends at the first of: `turn.done` arriving, the transcript
-    /// going quiet for `quiet` with text in hand, `no_event` passing with
-    /// nothing heard at all, or the hard `deadline`. When no accumulator is
-    /// running there is nothing to wait for and the commit is immediate.
+    /// The wait ends at the first of: every turn so far having completed and
+    /// `settle` passing with no new turn starting, the transcript going quiet
+    /// for `quiet` with text in hand, `no_event` passing with nothing heard at
+    /// all, or the hard `deadline`. When no accumulator is running there is
+    /// nothing to wait for and the commit is immediate.
     pub async fn finish(&self, t: Timings) -> Result<Committed, String> {
         *self.listening.lock().await = false;
         if self.accumulator.lock().await.is_some() {
@@ -167,20 +247,7 @@ impl DictateState {
         // separate locks lets a delta land in between and be silently dropped.
         let text = std::mem::take(&mut *self.incoming.lock().await).resolve();
 
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(Committed::Empty);
-        }
-        if config::get().hallucination_filter && is_hallucination(trimmed) {
-            info!("filtered hallucinated transcript");
-            return Ok(Committed::Filtered(trimmed.to_string()));
-        }
-
-        let safe = sanitize_for_injection(trimmed);
-        if safe.is_empty() {
-            return Ok(Committed::Empty);
-        }
-        Ok(Committed::Typed(safe))
+        Ok(classify(&text))
     }
 
     /// Block until the transcript has settled — see [`Timings`].
@@ -189,24 +256,40 @@ impl DictateState {
         loop {
             {
                 let inc = self.incoming.lock().await;
-                if inc.done.is_some() {
-                    info!("commit: turn.done received");
-                    return;
-                }
                 let elapsed = start.elapsed();
                 if elapsed >= t.deadline {
                     warn!(?elapsed, "commit: transcript deadline hit");
                     return;
                 }
-                if !inc.seen && elapsed >= t.no_event {
-                    info!("commit: no transcript events at all");
-                    return;
-                }
-                if let Some(last) = inc.last {
-                    if !inc.text.trim().is_empty() && last.elapsed() >= t.quiet {
-                        info!("commit: transcript went quiet");
+                // Time since the last transcript event, or since the wait began
+                // if none has arrived. A committed turn typically has no events
+                // yet, so anchoring only on `last` would leave it unmeasured.
+                let idle = inc.last.map(|l| l.elapsed()).unwrap_or(elapsed);
+                if inc.speech_open {
+                    // Audio has been accepted for transcription and its text is
+                    // owed. Words are at stake, so this waits the longest — and
+                    // it must outrank the no-event grace, which otherwise gives
+                    // up on a turn we know is coming. That ordering bug
+                    // committed every real dictation empty at 1.5 s while the
+                    // transcript, measured at 1.7-1.9 s, was still in flight.
+                    if idle >= t.open_turn {
+                        warn!(?idle, "commit: a committed turn never transcribed");
                         return;
                     }
+                } else if !inc.seen && elapsed >= t.no_event {
+                    info!("commit: no transcript events at all");
+                    return;
+                } else if !inc.pending.trim().is_empty() {
+                    // Deltas arrived but stalled without a `done`.
+                    if idle >= t.quiet {
+                        info!("commit: transcript went quiet mid-turn");
+                        return;
+                    }
+                } else if inc.turns > 0 && idle >= t.settle {
+                    // Every turn closed and none opened since: the dictation is
+                    // over. Waiting longer is pure latency.
+                    info!(turns = inc.turns, "commit: all turns settled");
+                    return;
                 }
             }
             tokio::time::sleep(t.poll).await;
@@ -229,15 +312,27 @@ impl DictateState {
         }
     }
 
+    /// Declare that audio has been committed and its transcript is owed.
+    ///
+    /// With server VAD off there are no `speech_started` events, so nothing
+    /// else tells the commit that a turn is in flight — it would see an idle
+    /// session and give up at the no-event grace while the transcript was still
+    /// being produced.
+    pub async fn expect_turn(&self) {
+        self.incoming.lock().await.speech_open = true;
+    }
+
     /// Live preview text for the pill.
     pub async fn current_buffer(&self) -> String {
         let inc = self.incoming.lock().await;
-        inc.done.clone().unwrap_or_else(|| inc.text.clone())
+        let mut out = inc.committed.clone();
+        append_segment(&mut out, &inc.pending);
+        out
     }
 
     #[cfg(test)]
     async fn set_text(&self, text: &str) {
-        self.incoming.lock().await.text = text.to_string();
+        self.incoming.lock().await.pending = text.to_string();
     }
 }
 
@@ -256,24 +351,52 @@ async fn accumulate_loop(mut rx: broadcast::Receiver<Notification>, incoming: Sh
                     // Deliberately not logging the delta itself: it is the
                     // user's speech and may contain secrets.
                     let mut inc = incoming.lock().await;
-                    inc.text.push_str(delta);
+                    inc.pending.push_str(delta);
                     inc.mark();
                 }
             }
-            // The authoritative end-of-turn transcript. Used in preference to
-            // the accumulated deltas, which can arrive partial or repeated.
+            // The authoritative transcript for the turn that just closed. It
+            // supersedes that turn's deltas (which can arrive partial or
+            // repeated) and is appended to the turns before it — one hold can
+            // contain several.
             Ok(n) if is_user_transcript_done(&n.method) => {
                 if let Some(text) = n.params.get("text").and_then(|t| t.as_str()) {
-                    let mut inc = incoming.lock().await;
-                    inc.done = Some(text.to_string());
-                    inc.mark();
+                    incoming.lock().await.finish_turn(text);
                 }
+            }
+            // VAD opened a turn. Deliberately does not `mark()`: this is not a
+            // transcript event, and letting it feed the quiet/no-event timers
+            // would keep a silent session waiting for the full deadline.
+            Ok(n) if is_speech_started(&n.method) => {
+                incoming.lock().await.speech_open = true;
             }
             Ok(_) => {}
             Err(RecvError::Closed) => break,
             Err(RecvError::Lagged(k)) => warn!(skipped = k, "dictate lagged"),
         }
     }
+}
+
+/// Judge raw transcript text: hallucination filter, then sanitize.
+///
+/// Shared so that a transcript from the session model and one from the
+/// input-transcription side channel are held to identical standards — the
+/// never-auto-Enter guarantee in particular must not depend on which produced
+/// it.
+pub fn classify(text: &str) -> Committed {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Committed::Empty;
+    }
+    if config::get().hallucination_filter && is_hallucination(trimmed) {
+        info!("filtered hallucinated transcript");
+        return Committed::Filtered(trimmed.to_string());
+    }
+    let safe = sanitize_for_injection(trimmed);
+    if safe.is_empty() {
+        return Committed::Empty;
+    }
+    Committed::Typed(safe)
 }
 
 pub fn is_hallucination(text: &str) -> bool {
@@ -325,6 +448,11 @@ pub fn is_user_transcript_delta(method: &str, params: &Value) -> bool {
 /// is enough — assistant turns never reach this notification.
 pub fn is_user_transcript_done(method: &str) -> bool {
     method == "thread/realtime/transcript/done"
+}
+
+/// Server VAD detected the start of an utterance.
+pub fn is_speech_started(method: &str) -> bool {
+    method == "thread/realtime/speech/started"
 }
 
 pub fn type_text_safe(text: &str) -> Result<(), RpcError> {
@@ -449,8 +577,10 @@ mod tests {
     /// Short timings so the wait-for-transcript tests stay fast.
     fn fast() -> Timings {
         Timings {
-            deadline: Duration::from_millis(600),
+            deadline: Duration::from_millis(900),
             quiet: Duration::from_millis(120),
+            open_turn: Duration::from_millis(300),
+            settle: Duration::from_millis(50),
             no_event: Duration::from_millis(200),
             poll: Duration::from_millis(10),
         }
@@ -467,6 +597,13 @@ mod tests {
         Notification {
             method: "thread/realtime/transcript/done".into(),
             params: json!({ "text": text }),
+        }
+    }
+
+    fn speech_started() -> Notification {
+        Notification {
+            method: "thread/realtime/speech/started".into(),
+            params: json!({}),
         }
     }
 
@@ -510,24 +647,181 @@ mod tests {
         );
     }
 
-    /// `turn.done` carries the authoritative transcript and wins over whatever
-    /// the deltas happened to accumulate.
+    /// `turn.done` carries the authoritative transcript for its turn and wins
+    /// over whatever that turn's deltas happened to accumulate.
     #[tokio::test]
-    async fn turn_done_overrides_accumulated_deltas_and_ends_the_wait() {
+    async fn turn_done_overrides_that_turns_deltas() {
         let (tx, _) = broadcast::channel(16);
         let state = DictateState::new();
         state.start_listening(tx.subscribe()).await.unwrap();
         tx.send(delta("안녕")).unwrap();
         tx.send(done("안녕하세요")).unwrap();
 
+        let t = fast();
         let start = Instant::now();
-        let out = state.finish(fast()).await.unwrap();
+        let out = state.finish(t).await.unwrap();
         assert_eq!(out, Committed::Typed("안녕하세요".into()));
         assert!(
-            start.elapsed() < Duration::from_millis(120),
-            "turn.done must end the wait immediately, took {:?}",
+            start.elapsed() < t.quiet,
+            "a settled turn must not wait out the full quiet window, took {:?}",
             start.elapsed()
         );
+    }
+
+    /// The bug that made real dictation unusable: server VAD closes a turn
+    /// after 500 ms of silence, so an ordinary sentence pause splits one hold
+    /// into several turns. Each `done` used to overwrite the last, so only the
+    /// final fragment survived and everything said before the pause was thrown
+    /// away.
+    #[tokio::test]
+    async fn every_turn_of_one_hold_is_kept() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+
+        tx.send(delta("안녕")).unwrap();
+        tx.send(done("안녕하세요.")).unwrap();
+        tx.send(delta("지금 마이크")).unwrap();
+        tx.send(done("지금 마이크 테스트를 하고 있습니다.")).unwrap();
+        tx.send(delta("오후에는 코드 리뷰를 해야 합니다.")).unwrap();
+
+        assert_eq!(
+            state.finish(fast()).await.unwrap(),
+            Committed::Typed(
+                "안녕하세요. 지금 마이크 테스트를 하고 있습니다. 오후에는 코드 리뷰를 해야 합니다."
+                    .into()
+            )
+        );
+    }
+
+    /// A turn whose audio VAD has already accepted must not be abandoned just
+    /// because its transcript is slow. Between `speech_started` and the
+    /// transcript there are no deltas at all, so a purely timer-based wait
+    /// committed early and dropped the last thing the user said.
+    #[tokio::test]
+    async fn an_open_turn_is_waited_for_even_with_no_deltas_yet() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(done("첫 문장입니다.")).unwrap();
+        tx.send(speech_started()).unwrap();
+
+        // Its transcript lands long after both the settle and the stalled-delta
+        // windows would have fired — only `open_turn` keeps the commit waiting.
+        let t = fast();
+        let lag = (t.quiet + t.open_turn) / 2;
+        assert!(lag > t.quiet && lag < t.open_turn, "lag must isolate open_turn");
+        let late = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(lag).await;
+            let _ = late.send(done("이어서 말합니다."));
+        });
+
+        let start = Instant::now();
+        let out = state.finish(t).await.unwrap();
+        assert_eq!(out, Committed::Typed("첫 문장입니다. 이어서 말합니다.".into()));
+        assert!(start.elapsed() >= lag, "committed before the open turn landed");
+    }
+
+    /// A committed turn has no transcript events yet by definition, so the
+    /// no-event grace must not apply to it. When it did, every real dictation
+    /// committed empty 1.5 s after key-up while the transcript — measured at
+    /// 1.7-1.9 s — was still in flight:
+    ///
+    /// ```text
+    /// audio capture stopped
+    /// commit: no transcript events at all      (1.5s later)
+    /// dictation committed: EMPTY  peak_rms=4851
+    /// ```
+    #[tokio::test]
+    async fn a_committed_turn_outranks_the_no_event_grace() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        // Exactly what `stop_dictation` does: commit the audio, then wait.
+        state.expect_turn().await;
+
+        let t = fast();
+        let lag = (t.no_event + t.open_turn) / 2;
+        assert!(lag > t.no_event && lag < t.open_turn, "lag must isolate the bug");
+        let late = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(lag).await;
+            let _ = late.send(done("늦게 도착한 전사"));
+        });
+
+        assert_eq!(
+            state.finish(t).await.unwrap(),
+            Committed::Typed("늦게 도착한 전사".into()),
+            "gave up on a turn we had committed audio for"
+        );
+    }
+
+    /// …but a committed turn whose transcript never comes still has to end.
+    #[tokio::test]
+    async fn a_committed_turn_that_never_transcribes_is_bounded() {
+        let state = DictateState::new();
+        let (tx, _) = broadcast::channel(16);
+        state.start_listening(tx.subscribe()).await.unwrap();
+        state.expect_turn().await;
+
+        let t = fast();
+        let start = Instant::now();
+        assert_eq!(state.finish(t).await.unwrap(), Committed::Empty);
+        let elapsed = start.elapsed();
+        assert!(elapsed >= t.open_turn, "gave up too early: {elapsed:?}");
+        assert!(elapsed < t.deadline, "waited the full deadline: {elapsed:?}");
+    }
+
+    /// The production windows must be ordered, or one silently shadows another
+    /// — which is how `open_turn` ended up unreachable behind `no_event`.
+    #[test]
+    fn default_timings_are_consistently_ordered() {
+        let t = Timings::default();
+        assert!(t.settle < t.quiet, "settle must be the quickest exit");
+        assert!(
+            t.open_turn > t.no_event,
+            "a committed turn must outlast the no-event grace"
+        );
+        assert!(
+            t.deadline > t.open_turn,
+            "the deadline must not pre-empt the open-turn window"
+        );
+    }
+
+    /// An open turn still cannot hold the commit open forever — a VAD hit whose
+    /// transcript never arrives is bounded by `open_turn`, not the deadline.
+    #[tokio::test]
+    async fn an_open_turn_that_never_transcribes_still_commits() {
+        let (tx, _) = broadcast::channel(16);
+        let state = DictateState::new();
+        state.start_listening(tx.subscribe()).await.unwrap();
+        tx.send(done("말한 것")).unwrap();
+        tx.send(speech_started()).unwrap();
+
+        let t = fast();
+        let start = Instant::now();
+        assert_eq!(state.finish(t).await.unwrap(), Committed::Typed("말한 것".into()));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= t.open_turn, "gave up too early: {elapsed:?}");
+        assert!(elapsed < t.deadline, "waited the full deadline: {elapsed:?}");
+    }
+
+    /// Segments are separate utterances and must not be glued together, however
+    /// the server pads them.
+    #[test]
+    fn segments_join_with_exactly_one_space() {
+        let mut out = String::new();
+        append_segment(&mut out, "안녕하세요.");
+        append_segment(&mut out, "  반갑습니다.  ");
+        append_segment(&mut out, "   ");
+        append_segment(&mut out, "");
+        append_segment(&mut out, "끝.");
+        assert_eq!(out, "안녕하세요. 반갑습니다. 끝.");
+
+        let mut first = String::new();
+        append_segment(&mut first, "  leading  ");
+        assert_eq!(first, "leading", "no space before the first segment");
     }
 
     /// A dead session must not stall the commit for the full deadline.

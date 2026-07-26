@@ -1,6 +1,6 @@
 [package]
 name = "codex-mic"
-version = "0.1.0"
+version = "0.2.0"
 description = "Codex Mic — a Tauri app that exposes Codex's thread realtime (mic) API"
 edition = "2021"
 rust-version = "1.77"

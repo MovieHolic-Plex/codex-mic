@@ -32,6 +32,15 @@ mod imp {
         Some(unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0)
     }
 
+    /// Is this virtual key physically held down right now?
+    ///
+    /// `GetAsyncKeyState` reads real hardware state and is not tied to the
+    /// calling thread's message queue (unlike `GetKeyState`), so a tokio worker
+    /// or a bare `std::thread` may call it.
+    pub fn key_is_down(vk: u16) -> Option<bool> {
+        Some(unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0)
+    }
+
     pub fn modifiers_held() -> bool {
         MODIFIERS
             .iter()
@@ -78,13 +87,18 @@ mod imp {
     pub fn caps_on() -> Option<bool> {
         None
     }
+    /// `None` off Windows: unknown, so callers fall back to the hotkey
+    /// library's own release detection instead of second-guessing it.
+    pub fn key_is_down(_vk: u16) -> Option<bool> {
+        None
+    }
     pub fn modifiers_held() -> bool {
         false
     }
     pub fn tap_capslock() {}
 }
 
-pub use imp::{caps_on, modifiers_held, tap_capslock};
+pub use imp::{caps_on, key_is_down, modifiers_held, tap_capslock};
 
 /// Block until no modifier is physically held, or `max` elapses.
 ///

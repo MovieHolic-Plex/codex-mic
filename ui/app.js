@@ -79,10 +79,57 @@ const fields = {
   restoreClipboard: document.getElementById("cfg-restore-clipboard"),
   appendSpace: document.getElementById("cfg-append-space"),
   language: document.getElementById("cfg-language"),
+  transcribeModel: document.getElementById("cfg-transcribe-model"),
+  realtimeModel: document.getElementById("cfg-realtime-model"),
   micGain: document.getElementById("cfg-mic-gain"),
   mic: document.getElementById("cfg-mic"),
   hallucinationFilter: document.getElementById("cfg-hallucination-filter"),
 };
+
+// Notes keyed by model id, so the note under each dropdown follows its choice.
+const modelNotes = { transcribe: {}, realtime: {} };
+
+function syncModelNote(kind, select, noteId) {
+  const note = document.getElementById(noteId);
+  if (note) note.textContent = modelNotes[kind][select.value] || "";
+}
+
+/// Populate a model dropdown from the backend's measured list.
+function fillModelSelect(kind, select, noteId, models, selected) {
+  const list = models || [];
+  const builtIn = list.find((m) => m.is_default);
+  modelNotes[kind] = {
+    // Say which model "기본값" actually resolves to, or it is an opaque choice.
+    "": builtIn ? `기본값 = ${builtIn.id}` : "",
+  };
+  select.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = "기본값";
+  select.appendChild(def);
+  for (const m of list) {
+    modelNotes[kind][m.id] = m.note;
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.is_default ? `${m.id} (기본값)` : m.id;
+    select.appendChild(opt);
+  }
+  // A model set from the config file or an older build may not be in the list;
+  // keep it rather than silently switching the user back to the default.
+  const want = selected || "";
+  if (want && !list.some((m) => m.id === want)) {
+    const opt = document.createElement("option");
+    opt.value = want;
+    opt.textContent = `${want} (목록 외)`;
+    select.appendChild(opt);
+  }
+  // Select by index rather than by `.value`: assigning an empty string to a
+  // <select> did not land on the empty-valued option here, leaving the control
+  // showing a model the config never asked for.
+  const idx = Array.from(select.options).findIndex((o) => o.value === want);
+  select.selectedIndex = idx >= 0 ? idx : 0;
+  syncModelNote(kind, select, noteId);
+}
 
 function fillForm(cfg, mics) {
   fields.hotkey.value = cfg.hotkey;
@@ -117,6 +164,10 @@ function syncInjectionRow() {
     fields.injectionMode.value === "clipboard" ? "" : "none";
 }
 fields.injectionMode.addEventListener("change", syncInjectionRow);
+fields.transcribeModel.addEventListener("change", () =>
+  syncModelNote("transcribe", fields.transcribeModel, "transcribe-model-note"));
+fields.realtimeModel.addEventListener("change", () =>
+  syncModelNote("realtime", fields.realtimeModel, "realtime-model-note"));
 
 function readForm() {
   return {
@@ -129,6 +180,8 @@ function readForm() {
     restore_clipboard: fields.restoreClipboard.checked,
     append_trailing_space: fields.appendSpace.checked,
     language: fields.language.value,
+    transcribe_model: fields.transcribeModel.value,
+    realtime_model: fields.realtimeModel.value,
     mic_gain_db: parseFloat(fields.micGain.value) || 0,
     mic_device: fields.mic.value || null,
     hallucination_filter: fields.hallucinationFilter.checked,
@@ -140,9 +193,18 @@ async function openSettings() {
   settings.hidden = false;
   settingsStatus.textContent = "";
   try {
-    const [cfg, mics] = await Promise.all([invoke("get_config"), invoke("list_mics")]);
+    const [cfg, mics, transcribers, sessions] = await Promise.all([
+      invoke("get_config"),
+      invoke("list_mics"),
+      invoke("list_transcribe_models").catch(() => []),
+      invoke("list_realtime_models").catch(() => []),
+    ]);
     config = cfg;
     fillForm(cfg, mics);
+    fillModelSelect("transcribe", fields.transcribeModel, "transcribe-model-note",
+      transcribers, cfg.transcribe_model);
+    fillModelSelect("realtime", fields.realtimeModel, "realtime-model-note",
+      sessions, cfg.realtime_model);
   } catch (e) {
     settingsStatus.textContent = `설정 로드 실패: ${e}`;
   }
