@@ -46,6 +46,13 @@ fn stale_after() -> Duration {
 /// dictation quality is the whole point of this tool.
 const TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
 
+/// Bias for the transcriber. Without a prompt the model drifts into
+/// transliterating English speech into the account locale's script (measured:
+/// "더 퀵 브라운 폭스 점프스…"). With it, clean original-script text.
+const TRANSCRIPTION_PROMPT: &str = "The user dictates text messages in English \
+    and Korean for software development work. Transcribe verbatim in the \
+    original language and script. Do not transliterate.";
+
 /// The session doubles as a voice agent; for dictation we want a stenographer.
 /// output_modalities is text-only so it cannot speak back.
 fn instructions() -> String {
@@ -58,6 +65,16 @@ fn instructions() -> String {
         crate::config::Language::Auto => base.to_string(),
         crate::config::Language::Korean => format!("{base} The user usually speaks Korean."),
         crate::config::Language::English => format!("{base} The user usually speaks English."),
+    }
+}
+
+/// ISO-639-1 hint for the transcription model. Only pinned when the user
+/// picks a language explicitly — Auto leaves it unset.
+fn transcription_language() -> Option<&'static str> {
+    match crate::config::get().language {
+        crate::config::Language::Auto => None,
+        crate::config::Language::Korean => Some("ko"),
+        crate::config::Language::English => Some("en"),
     }
 }
 
@@ -297,6 +314,13 @@ async fn handle_event(
                 let _ = tx.send(id);
             }
             // Configure the session: text-only output, VAD, input transcription.
+            let mut transcription = json!({
+                "model": TRANSCRIPTION_MODEL,
+                "prompt": TRANSCRIPTION_PROMPT,
+            });
+            if let Some(lang) = transcription_language() {
+                transcription["language"] = json!(lang);
+            }
             let update = json!({
                 "type": "session.update",
                 "session": {
@@ -312,7 +336,8 @@ async fn handle_event(
                                 "prefix_padding_ms": 300,
                                 "silence_duration_ms": 500
                             },
-                            "transcription": { "model": TRANSCRIPTION_MODEL }
+                            "noise_reduction": { "type": "near_field" },
+                            "transcription": transcription,
                         }
                     }
                 }
