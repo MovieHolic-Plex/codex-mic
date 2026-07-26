@@ -1,10 +1,16 @@
 # Codex Mic
 
-**Codex CLI 로그인 그대로 돌아가는 윈도우 음성 받아쓰기. API 키도, 구독도, 새로
-만들 계정도 없다.**
+**OpenAI 실시간 음성 API로 받아쓰는 윈도우 받아쓰기 도구. 인증은 Codex CLI
+로그인을 그대로 쓴다. API 키도, 구독도, 새로 만들 계정도 없다.**
 
-이 PC에서 `codex login`이 되어 있다면 더 설정할 게 없다. `Ctrl+E`를 누른 채로
-말하고 손을 떼면 커서가 있는 곳에 받아쓴다.
+API 키로 붙는 공개 realtime 엔드포인트가 아니라, Codex 데스크톱 앱이 쓰는 ChatGPT
+백엔드 쪽에 `codex login`이 남겨둔 OAuth 토큰으로 붙는다. 키가 필요 없는 이유가
+이거다.
+
+마이크는 cpal로 잡아 Rust에서 Opus로 인코딩한 뒤 WebRTC 트랙으로 바로 나간다.
+오디오는 webview를 거치지 않고, 전사는 데이터 채널로 스트리밍되어 돌아온다.
+
+`Ctrl+E`를 누른 채로 말하고 손을 떼면 커서가 있는 곳에 받아쓴다.
 
 [English](README.en.md)
 
@@ -126,13 +132,19 @@ cargo run --example hotkeys    # 키 문자열이 등록 가능한지 확인
 
 </details>
 
-<details>
-<summary><b>동작과 구조</b></summary>
+## 동작
 
 ```
-누름 → cpal 캡처(48kHz mono) → 게인 → Opus 인코딩 → WebRTC 세션
+누름 → cpal 캡처(48kHz mono) → 게인 → Opus 인코딩 → WebRTC 미디어 트랙
+                                                   ↓
+                                      chatgpt.com/backend-api/codex/realtime
+                                      모델 gpt-live-1-boulder-alpha
+                                                   ↓
 뗌   → 남은 PCM 전송 → 부분 프레임 flush → 무음 꼬리 → 최종 전사 대기 → 타이핑
 ```
+
+세션은 `oai-events` 데이터 채널로 이벤트를 돌려준다. 그중 사용자 발화 전사만
+골라 쓰고 모델이 말하려는 출력은 버린다. 받아쓰기지 대화가 아니니까.
 
 전사는 음성보다 늦게 도착한다. 키를 뗀 순간 커밋하면 문장 끝이 잘리고 짧은 말은
 통째로 비어버린다. 그래서 손을 뗀 뒤에 펌프가 못 읽은 오디오를 마저 보내고, 서버가
@@ -142,9 +154,6 @@ cargo run --example hotkeys    # 키 문자열이 등록 가능한지 확인
 녹음을 시작하거나 멈출 수 있는 모든 경로(키 누름과 뗌, 무음 자동 종료, 세션 오류,
 "연결 중에 손을 뗌")는 상태 머신 하나를 통과한다. 두 경로가 같은 녹음을 동시에
 시작하거나 동시에 멈추는 일이 생기지 않는다.
-
-오디오는 webview를 거치지 않는다. cpal로 캡처해서 Rust에서 Opus로 인코딩하고
-WebRTC 트랙으로 바로 보낸다.
 
 ```
 src-tauri/src/
@@ -163,8 +172,6 @@ examples/      devices.rs, micprobe.rs, hotkeys.rs
 
 작은 단일 목적 모듈들이고 테스트가 바로 옆에 붙어 있다. 핫키든 프롬프트든 게인이든
 입력 방식이든 마음대로 고쳐 써라.
-
-</details>
 
 ## 라이선스
 

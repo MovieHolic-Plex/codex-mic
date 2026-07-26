@@ -1,11 +1,18 @@
 # Codex Mic
 
-**Windows voice dictation that runs on your Codex CLI login. No API key, no
-subscription, no new account.**
+**Windows dictation on OpenAI's realtime speech API, authenticated with your
+Codex CLI login. No API key, no subscription, no new account.**
 
-If `codex login` works on this machine, there is nothing else to set up. Hold
-`Ctrl+E`, speak, release, and the transcript is typed wherever the keyboard focus
-is.
+Not the public realtime endpoint you reach with an API key: it connects to the
+ChatGPT backend the Codex desktop app uses, with the OAuth token `codex login`
+left behind. That is why there is no key to manage.
+
+The microphone is captured by cpal, encoded to Opus in Rust, and pushed straight
+onto a WebRTC track. Audio never touches the webview, and transcripts stream back
+over the data channel.
+
+Hold `Ctrl+E`, speak, release, and the transcript is typed wherever the keyboard
+focus is.
 
 [한국어](README.md)
 
@@ -132,14 +139,21 @@ that instead of the microphone. Separates capture bugs from session bugs.
 
 </details>
 
-<details>
-<summary><b>How it works</b></summary>
+## How it works
 
 ```
-press   → cpal capture (48 kHz mono) → gain → Opus → WebRTC session
+press   → cpal capture (48 kHz mono) → gain → Opus → WebRTC media track
+                                                   ↓
+                                     chatgpt.com/backend-api/codex/realtime
+                                     model gpt-live-1-boulder-alpha
+                                                   ↓
 release → send the leftover PCM → flush the partial frame → silence tail
         → wait for the final transcript → type (or Ctrl+V)
 ```
+
+The session returns events on an `oai-events` data channel. Only the user's own
+speech transcript is used; anything the model tries to say back is discarded.
+This is a stenographer, not a conversation.
 
 Transcription lags speech. Committing the moment the key comes up truncates the
 end of every sentence and returns nothing at all for short ones. So the release
@@ -151,9 +165,6 @@ Everything that can start or stop a recording (key down and up, silence
 auto-stop, session failure, "you let go while we were still connecting") goes
 through one state machine, so two paths can never both start or both stop the
 same recording.
-
-Audio never touches the webview: cpal captures it, Rust encodes Opus, and it goes
-straight out on a WebRTC track.
 
 ```
 src-tauri/src/
@@ -172,8 +183,6 @@ examples/      devices.rs, micprobe.rs, hotkeys.rs
 
 Small single-purpose modules with tests next to them. Change the hotkeys, the
 prompt, the gain, the injection style — it is all yours.
-
-</details>
 
 ## License
 
