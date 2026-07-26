@@ -24,13 +24,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 enigo = "0.6"
 cpal = "0.15"
 base64 = "0.22"
-webrtc = "0.17.2"
 reqwest = { version = "0.13.3", features = ["json"] }
-bytes = "1.12.1"
 time = { version = "0.3.41", features = ["formatting"] }
-audiopus_sys = { version = "0.2.2", features = ["static"] }
 rustls = { version = "0.23.42", features = ["ring"] }
 arboard = "3.6.1"
+tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
+futures-util = "0.3.33"
 
 [target.'cfg(windows)'.dependencies]
 # Keyboard toggle/hold state: caps restoration by comparison, and holding the

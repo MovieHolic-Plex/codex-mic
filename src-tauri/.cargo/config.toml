@@ -1,5 +1,0 @@
-# CMake 4.x removed compatibility with projects requiring < 3.5, and the
-# vendored libopus sources (audiopus_sys) predate that floor. Without this,
-# `cargo build` fails in the opus cmake configure step.
-[env]
-CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -7,24 +7,18 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// The realtime call negotiates Opus at 48 kHz mono. Capture devices rarely
-/// offer exactly that (WASAPI shared mode is pinned to the mixer format, often
-/// 44.1 kHz), so we open the device at *its* format and resample here.
-pub const TARGET_SAMPLE_RATE: u32 = 48_000;
+/// The realtime session expects 24 kHz mono PCM16. Capture devices rarely
+/// offer that natively (WASAPI shared mode is pinned to the mixer format,
+/// usually 48 kHz), so we open the device at *its* format and resample here.
+pub const TARGET_SAMPLE_RATE: u32 = 24_000;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Capture gain, applied to float samples before resampling.
-///
-/// USB/laptop microphones routinely deliver -40 dBFS speech (RMS ~0.008),
-/// which the realtime VAD never fires on — verified live: both this machine's
-/// USB mic and Realtek array produced speech at that level and got zero
-/// transcription. Rust-side AGC fixes it without asking the user to dig
-/// through Windows sound control panels (VoiceInk/Superwhisper ship the same
-/// kind of "boost quiet mic" option). 20 dB turns -40 dB speech into -20 dB;
-/// the soft limiter keeps loud sources from clipping.
-pub const CAPTURE_GAIN_DB: f32 = 20.0;
-
+/// Capture gain comes from config (`mic_gain_db`). USB/laptop microphones
+/// routinely deliver -40 dBFS speech, which the realtime VAD never fires on —
+/// verified live: both this machine's USB mic and Realtek array produced
+/// speech at that level and got zero transcription. Rust-side AGC fixes it
+/// without asking the user to dig through Windows sound control panels.
 fn capture_gain() -> f32 {
     10f32.powf(crate::config::get().mic_gain_db / 20.0)
 }
@@ -456,10 +450,10 @@ mod tests {
             samples as f64 / 1.5
         );
 
-        // 1.5s at 48kHz is 72000 samples; allow slack for thread scheduling.
+        // 1.5s at 24kHz is 36000 samples; allow slack for thread scheduling.
         assert!(
-            (60_000..=84_000).contains(&samples),
-            "got {samples} samples in 1.5s (expected ~72000) — resampling is off-rate"
+            (30_000..=42_000).contains(&samples),
+            "got {samples} samples in 1.5s (expected ~36000) — resampling is off-rate"
         );
         capture.stop();
 

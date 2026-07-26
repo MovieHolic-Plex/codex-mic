@@ -4,8 +4,6 @@ mod commands;
 mod config;
 mod dictate;
 mod error;
-#[allow(dead_code)] // PCMU fallback path kept from the codec probes
-mod g711;
 mod keystate;
 mod realtime;
 mod winkeys;
@@ -675,7 +673,18 @@ mod integration {
 
         let (session, info) = RealtimeSession::connect(emitter).await.expect("connect");
         assert!(!info.call_id.is_empty(), "call id must be populated");
-        assert_eq!(info.auth_mode, "chatgpt-oauth");
+        assert_eq!(info.auth_mode, "chatgpt-oauth-ws");
+
+        // Test files are 48 kHz; the session wants 24 kHz. 2:1 boxcar is fine
+        // for a fixture.
+        let pcm: Vec<u8> = pcm
+            .chunks_exact(4)
+            .flat_map(|c| {
+                let a = i16::from_le_bytes([c[0], c[1]]) as i32;
+                let b = i16::from_le_bytes([c[2], c[3]]) as i32;
+                (((a + b) / 2) as i16).to_le_bytes()
+            })
+            .collect();
 
         // Stream at real-time pace: 20 ms of PCM (1920 bytes) per tick, while a
         // collector timestamps every transcript event — the timeline proves the
@@ -704,7 +713,7 @@ mod integration {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
-        let frame_bytes = crate::realtime::OPUS_FRAME_SAMPLES * 2;
+        let frame_bytes = (crate::realtime::SESSION_SAMPLE_RATE as usize / 50) * 2; // 20ms
         let mut ticker = tokio::time::interval(Duration::from_millis(20));
         for chunk in pcm.chunks(frame_bytes) {
             ticker.tick().await;

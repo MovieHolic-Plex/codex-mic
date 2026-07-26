@@ -135,15 +135,15 @@ cargo run --example hotkeys    # 키 문자열이 등록 가능한지 확인
 ## 동작
 
 ```
-누름 → cpal 캡처(48kHz mono) → 게인 → Opus 인코딩 → WebRTC 미디어 트랙
+누름 → cpal 캡처(→ 24kHz mono) → 게인 → base64 PCM16 → realtime WebSocket
                                                    ↓
-                                      chatgpt.com/backend-api/codex/realtime
-                                      모델 gpt-live-1-boulder-alpha
+                       api.openai.com/v1/realtime?model=gpt-realtime-1.5
+                       (Codex CLI OAuth bearer, gpt-4o-transcribe 전사)
                                                    ↓
-뗌   → 남은 PCM 전송 → 부분 프레임 flush → 무음 꼬리 → 최종 전사 대기 → 타이핑
+뗌   → 남은 PCM 전송 → 무음 꼬리 + commit → 최종 전사 대기 → 타이핑
 ```
 
-세션은 `oai-events` 데이터 채널로 이벤트를 돌려준다. 그중 사용자 발화 전사만
+세션은 WebSocket 이벤트로 전사를 돌려준다. 그중 사용자 발화 전사만
 골라 쓰고 모델이 말하려는 출력은 버린다. 받아쓰기지 대화가 아니니까.
 
 전사는 음성보다 늦게 도착한다. 키를 뗀 순간 커밋하면 문장 끝이 잘리고 짧은 말은
