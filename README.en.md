@@ -26,8 +26,10 @@ Hold `Ctrl+E`, talk, let go. That's it.<br>
 
 <br>
 
-> [!NOTE]
-> An unofficial project, unaffiliated with OpenAI. The realtime protocol was reverse engineered and can change without warning.
+> [!CAUTION]
+> **Use this and get screwed, that's on you.**
+>
+> An unofficial project, unaffiliated with OpenAI. The realtime protocol was reverse engineered; it can break or change without warning. No guarantees about anything that happens to your account. You're on your own.
 
 ---
 

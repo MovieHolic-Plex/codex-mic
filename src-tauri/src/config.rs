@@ -91,7 +91,10 @@ impl Default for Config {
             realtime_model: String::new(),
             transcribe_model: String::new(),
             mic_device: None,
-            mic_gain_db: 20.0,
+            // The Codex desktop app applies no capture gain, so neither does
+            // this by default. Raising it is available in settings for a
+            // genuinely quiet microphone; the limiter keeps it from clipping.
+            mic_gain_db: 0.0,
             hallucination_filter: true,
             window_x: None,
             window_y: None,
@@ -237,10 +240,15 @@ mod tests {
     /// a named model would be indistinguishable to the user.
     #[test]
     fn the_default_models_are_offered_in_the_settings_lists() {
+        // The WebRTC transport has no separate transcription model — the
+        // session model produces the transcript itself — so its list is empty
+        // and there is nothing to offer.
+        let transcribers = crate::realtime::TRANSCRIPTION_MODELS;
         assert!(
-            crate::realtime::TRANSCRIPTION_MODELS
-                .iter()
-                .any(|(id, _)| *id == crate::realtime::default_transcription_model()),
+            transcribers.is_empty()
+                || transcribers
+                    .iter()
+                    .any(|(id, _)| *id == crate::realtime::default_transcription_model()),
             "the default transcription model is missing from its dropdown"
         );
         assert!(

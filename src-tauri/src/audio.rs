@@ -10,7 +10,7 @@ use tracing::{info, warn};
 /// The realtime session expects 24 kHz mono PCM16. Capture devices rarely
 /// offer that natively (WASAPI shared mode is pinned to the mixer format,
 /// usually 48 kHz), so we open the device at *its* format and resample here.
-pub const TARGET_SAMPLE_RATE: u32 = 24_000;
+pub const TARGET_SAMPLE_RATE: u32 = crate::realtime::SESSION_SAMPLE_RATE;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -55,10 +55,10 @@ pub mod dump {
         })
     }
 
-    /// 44-byte canonical WAV header for 24 kHz mono PCM16LE.
-    fn header(data_len: u32) -> [u8; 44] {
-        let rate = super::TARGET_SAMPLE_RATE;
-        let byte_rate = rate * 2;
+    /// 44-byte canonical WAV header for PCM16LE.
+    fn header_for(rate: u32, channels: u16, data_len: u32) -> [u8; 44] {
+        let block_align = 2 * channels;
+        let byte_rate = rate * block_align as u32;
         let mut h = [0u8; 44];
         h[0..4].copy_from_slice(b"RIFF");
         h[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
@@ -66,19 +66,72 @@ pub mod dump {
         h[12..16].copy_from_slice(b"fmt ");
         h[16..20].copy_from_slice(&16u32.to_le_bytes()); // PCM chunk size
         h[20..22].copy_from_slice(&1u16.to_le_bytes()); // format: PCM
-        h[22..24].copy_from_slice(&1u16.to_le_bytes()); // channels: mono
+        h[22..24].copy_from_slice(&channels.to_le_bytes());
         h[24..28].copy_from_slice(&rate.to_le_bytes());
         h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
-        h[32..34].copy_from_slice(&2u16.to_le_bytes()); // block align
+        h[32..34].copy_from_slice(&block_align.to_le_bytes());
         h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits per sample
         h[36..40].copy_from_slice(b"data");
         h[40..44].copy_from_slice(&data_len.to_le_bytes());
         h
     }
 
+    fn header(data_len: u32) -> [u8; 44] {
+        header_for(super::TARGET_SAMPLE_RATE, 1, data_len)
+    }
+
     #[cfg(test)]
     pub fn header_for_test(data_len: u32) -> [u8; 44] {
         header(data_len)
+    }
+
+    /// The device stream exactly as cpal delivered it — before downmix, gain
+    /// and resampling.
+    ///
+    /// `CODEX_MIC_DEBUG_DUMP_RAW` points at a path. Comparing this against the
+    /// `DUMP_WAV` output is the only way to tell whether a bad transcript is
+    /// the microphone's fault or something this app did to the signal on the
+    /// way out: multi-channel averaging, the gain stage, or decimating without
+    /// an anti-alias filter.
+    static RAW: OnceLock<Option<Mutex<Sink>>> = OnceLock::new();
+
+    fn raw_sink(rate: u32, channels: u16) -> &'static Option<Mutex<Sink>> {
+        RAW.get_or_init(|| {
+            let path = std::env::var("CODEX_MIC_DEBUG_DUMP_RAW").ok()?;
+            match File::create(&path) {
+                Ok(mut file) => {
+                    if file.write_all(&header_for(rate, channels, 0)).is_err() {
+                        return None;
+                    }
+                    info!(path, rate, channels, "debug dump: writing raw device audio");
+                    Some(Mutex::new(Sink { file, written: 0 }))
+                }
+                Err(e) => {
+                    warn!(error = %e, path, "debug dump: could not create raw file");
+                    None
+                }
+            }
+        })
+    }
+
+    /// Append interleaved device samples. A no-op unless the env var is set.
+    pub fn write_raw(samples: &[f32], rate: u32, channels: u16) {
+        let Some(lock) = raw_sink(rate, channels) else { return };
+        let mut sink = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+            .collect();
+        if sink.file.write_all(&bytes).is_err() {
+            return;
+        }
+        sink.written = sink.written.saturating_add(bytes.len() as u32);
+        let patched = header_for(rate, channels, sink.written);
+        let _ = sink
+            .file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| sink.file.write_all(&patched))
+            .and_then(|_| sink.file.seek(SeekFrom::End(0)));
     }
 
     /// Append PCM16LE bytes. A no-op unless the env var is set.
@@ -108,18 +161,41 @@ fn capture_gain() -> f32 {
     10f32.powf(crate::config::get().mic_gain_db / 20.0)
 }
 
-/// Apply gain with a clip ceiling. Returns true if clipping occurred — the
-/// caller halves the gain so loud input stays clean.
-fn apply_gain(samples: &mut [f32], gain: f32) -> bool {
-    let mut clipped = false;
+/// Loudest sample in a block, as a fraction of full scale.
+fn block_peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+}
+
+/// Ceiling the limiter aims for. Below full scale so a slightly louder next
+/// block still has somewhere to go.
+const LIMIT: f32 = 0.9;
+
+/// Apply gain that cannot clip.
+///
+/// The old version multiplied by a fixed gain and hard-clamped whatever came
+/// out, halving the gain only *after* the damage. With the default +20 dB and
+/// a quiet array microphone that meant the opening of every dictation was a
+/// square wave, and it measurably wrecked recognition — the same sentence,
+/// transcribed from this app's own output versus the untouched capture:
+///
+/// ```text
+/// as sent (gain + clamp)   "방이 추가되었습니다."
+/// untouched capture        "아니 시발 장난하냐?"
+/// ```
+///
+/// The block's own peak decides the ceiling instead, so the signal is lifted as
+/// far as it can go and no further. Returns the gain actually used.
+fn apply_gain(samples: &mut [f32], gain: f32) -> f32 {
+    let peak = block_peak(samples);
+    let effective = if peak > 0.0 {
+        gain.min(LIMIT / peak)
+    } else {
+        gain
+    };
     for s in samples.iter_mut() {
-        let v = *s * gain;
-        if v.abs() > 0.98 {
-            clipped = true;
-        }
-        *s = v.clamp(-0.98, 0.98);
+        *s = (*s * effective).clamp(-1.0, 1.0);
     }
-    clipped
+    effective
 }
 
 /// Linear resampler with cross-block continuity.
@@ -335,13 +411,17 @@ fn capture_thread(
     let mut mono: Vec<f32> = Vec::new();
     let mut resampled: Vec<i16> = Vec::new();
     let mut resampler = Resampler::new(src_rate, TARGET_SAMPLE_RATE);
-    let mut gain = capture_gain();
+    let gain = capture_gain();
+    let mut last_limit_log = std::time::Instant::now() - Duration::from_secs(10);
 
     let mut emit = move |input: &[f32], tx: &mpsc::Sender<Vec<u8>>| {
+        // Untouched, before anything this app does to the signal.
+        dump::write_raw(input, src_rate, channels as u16);
         downmix(input, channels, &mut mono);
-        if apply_gain(&mut mono, gain) && gain > 1.0 {
-            gain = (gain / 2.0).max(1.0);
-            info!(new_gain = gain, "capture gain reduced (clipping detected)");
+        let used = apply_gain(&mut mono, gain);
+        if used < gain * 0.99 && last_limit_log.elapsed() >= Duration::from_secs(1) {
+            last_limit_log = std::time::Instant::now();
+            info!(configured = gain, used, "capture gain limited to avoid clipping");
         }
         resampled.clear();
         resampler.process(&mono, &mut resampled);
@@ -455,13 +535,37 @@ mod tests {
     }
 
     #[test]
-    fn gain_boosts_quiet_signal_without_clipping() {
-        let mut quiet = vec![0.008f32; 100]; // Realtek-level speech
-        assert!(!apply_gain(&mut quiet, 10.0));
+    fn gain_boosts_quiet_signal_fully() {
+        let mut quiet = vec![0.008f32; 100]; // array-microphone-level speech
+        assert_eq!(apply_gain(&mut quiet, 10.0), 10.0, "headroom to spare");
         assert!(quiet.iter().all(|&s| (s - 0.08).abs() < 1e-6));
-        let mut loud = vec![0.5f32; 100];
-        assert!(apply_gain(&mut loud, 10.0));
-        assert!(loud.iter().all(|&s| s <= 0.98));
+    }
+
+    /// The defect that wrecked recognition: +20 dB on a signal that peaks at
+    /// 11% of full scale is 113%, and the old code clamped the overflow flat.
+    /// The limiter must back the gain off instead, so nothing is ever squared
+    /// off.
+    #[test]
+    fn gain_never_clips_however_loud_the_block() {
+        for peak in [0.113f32, 0.3, 0.5, 0.9, 1.0] {
+            let mut block = vec![peak; 64];
+            block[7] = -peak;
+            let used = apply_gain(&mut block, 10.0);
+            let out = block_peak(&block);
+            assert!(out <= LIMIT + 1e-5, "peak {peak}: output reached {out}");
+            assert!(used <= 10.0 + 1e-6);
+            // And it still uses all the headroom there is.
+            assert!(out >= LIMIT - 1e-3, "peak {peak}: only reached {out}");
+        }
+    }
+
+    /// Silence must not be amplified into anything, and must not divide by zero.
+    #[test]
+    fn silence_survives_the_limiter() {
+        let mut quiet = vec![0.0f32; 32];
+        let used = apply_gain(&mut quiet, 10.0);
+        assert_eq!(used, 10.0);
+        assert!(quiet.iter().all(|&s| s == 0.0));
     }
 
     #[test]
